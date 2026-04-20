@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "1045725821597",
+    "project_id": "fincell-b9995",
+    "storage_bucket": "fincell-b9995.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1045725821597:android:2c020c7022bbef7eee7274",
+        "android_client_info": {
+          "package_name": "com.example.fincell"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1045725821597-3ketn6n4g5tl7l070roloh52cl1vebl6.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.fincell",
+            "certificate_hash": "b7b9c327aa629cc2ba929640b0597b26e6152efb"
+          }
+        },
+        {
+          "client_id": "1045725821597-70voe1tbd50a73gdvkg8ediu66qrk79s.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyADqDYVYMoL6T9C-hwAjEQXjjpMr-GnB28"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1045725821597-70voe1tbd50a73gdvkg8ediu66qrk79s.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

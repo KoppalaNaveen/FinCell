@@ -1,0 +1,606 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:local_auth/local_auth.dart';
+import 'dart:async';
+
+import '../services/device_service.dart';
+import '../services/permission_service.dart';
+import '../services/lost_mode_service.dart';
+import '../services/code_service.dart';
+import '../services/background_service.dart';
+
+import 'package:flutter/foundation.dart';
+
+import 'trace_page.dart';
+import 'profile_page.dart';
+
+class HomePage extends StatefulWidget {
+  final Function(ThemeMode) onThemeChanged;
+
+  const HomePage({super.key, required this.onThemeChanged});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  String? deviceId;
+  String? uniqueCode;
+
+  bool loading = true;
+  String? initError;
+
+  bool _trackingStarted = false;
+
+  final LocalAuthentication auth = LocalAuthentication();
+  bool showCode = false;
+  Timer? hideTimer;
+
+  StreamSubscription<DocumentSnapshot>? _userListener;
+
+  @override
+  void dispose() {
+    hideTimer?.cancel();
+    _userListener?.cancel();
+    super.dispose();
+  }
+  // 🔥 STEP 2: ADD HERE
+    Future<void> _handlePermissions() async {
+      if (kIsWeb) return;
+
+      bool granted = await PermissionService.setupTrackingPermissions();
+      if (!granted) {
+        _showPermissionDialog();
+      }
+    }
+
+    // 🔥 STEP 3: ADD HERE
+    void _showPermissionDialog() {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: const Text("Permission Required"),
+          content: const Text(
+            "Location permission is required to track your device.\n\nPlease allow it to continue."
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context); // 🔥 ONLY CLOSE DIALOG
+              },
+              child: const Text("OK"),
+            ),
+          ],
+        ),
+      );
+    }
+
+  // ================= AUTH =================
+
+  Future<void> _authenticateAndShowCode() async {
+    if (kIsWeb) {
+      setState(() => showCode = true);
+      hideTimer?.cancel();
+      hideTimer = Timer(const Duration(seconds: 1), () {
+        if (mounted) setState(() => showCode = false);
+      });
+      return;
+    }
+
+    try {
+      bool canAuthenticate =
+          await auth.canCheckBiometrics || await auth.isDeviceSupported();
+
+      if (!canAuthenticate) {
+        _showMsg("Authentication not available");
+        return;
+      }
+
+      bool authenticated = await auth.authenticate(
+        localizedReason: "Authenticate to view device code",
+        options: const AuthenticationOptions(
+          biometricOnly: false,
+          stickyAuth: true,
+        ),
+      );
+
+      if (authenticated) {
+        setState(() => showCode = true);
+        hideTimer?.cancel();
+        hideTimer = Timer(const Duration(seconds: 2), () {
+          if (mounted) setState(() => showCode = false);
+        });
+      }
+    } catch (e) {
+      _showMsg("Authentication unavailable");
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+
+    if (!kIsWeb) {
+      BackgroundTracking.initializeNativeListener();
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _handlePermissions();
+      await _initApp();
+    });
+    Future.delayed(const Duration(seconds: 3), () async {
+      if (!kIsWeb && uniqueCode != null) {
+
+        final doc = await FirebaseFirestore.instance
+            .collection('device_codes')
+            .doc(uniqueCode!)
+            .get();
+
+        final isLost = doc.data()?['isLost'] ?? false;
+
+        if (isLost) {
+          debugPrint("🔁 Auto-restarting tracking...");
+          await BackgroundTracking.start(uniqueCode!);
+        }
+      }
+    });
+  }
+
+  // ================= INIT =================
+
+  Future<void> _initApp() async {
+      try {
+        // 🔥 DO NOT request permissions again here
+        // Already handled in _handlePermissions()
+
+        deviceId = await DeviceService.registerDevice();
+        if (deviceId == null) throw Exception("Device registration failed");
+
+        final uid = FirebaseAuth.instance.currentUser?.uid;
+
+        if (uid != null) {
+          _userListener = FirebaseFirestore.instance
+              .collection('users')
+              .doc(uid)
+              .snapshots()
+              .listen((doc) async {
+
+            if (!doc.exists || !mounted) return;
+
+            final data = doc.data();
+            final code = data?['uniqueCode'];
+
+            setState(() {
+              uniqueCode =
+                  (code != null && code.toString().isNotEmpty) ? code : null;
+            });
+
+            // 🔥 FIXED LOGIC
+            final isLost = data?['isLost'] ?? false;
+
+            if (!kIsWeb && uniqueCode != null && isLost && !_trackingStarted) {
+
+              debugPrint("🚀 Ensuring tracking running for: $uniqueCode");
+
+              bool granted =
+                  await PermissionService.setupTrackingPermissions();
+
+              if (!granted) {
+                debugPrint("❌ Permission not granted");
+                return;
+              }
+
+              final started = await BackgroundTracking.start(uniqueCode!);
+
+              if (started) {
+                _trackingStarted = true; // 🔥 PREVENT MULTIPLE STARTS
+                debugPrint("✅ Tracking started successfully");
+              } else {
+                debugPrint("❌ Tracking start failed");
+              }
+            }
+          });
+        }
+
+        await _checkSecuritySetup();
+
+      } catch (e) {
+        initError = e.toString();
+      } finally {
+        if (mounted) {
+          setState(() => loading = false);
+        }
+      }
+    }
+  // ================= CREATE CODE =================
+
+  Future<void> _chooseCode() async {
+    if (deviceId == null) {
+      _showMsg("Device not initialized");
+      return;
+    }
+
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Create Your Code"),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(hintText: "Enter 6-8 chars code"),
+          textCapitalization: TextCapitalization.characters,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, "SYSTEM"),
+            child: const Text("System Generate"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim().toUpperCase()),
+            child: const Text("Create"),
+          ),
+        ],
+      ),
+    );
+
+    if (result == null) return;
+
+    String? code;
+    if (result == "SYSTEM") {
+      code = await CodeService.generateSystemCode(deviceId!);
+    } else {
+      if (result.length < 6) {
+        _showMsg("Code must be at least 6 characters");
+        return;
+      }
+      code = await CodeService.createCustomCode(result, deviceId!);
+    }
+
+    if (code == null) {
+      _showMsg("Code already taken. Try another.");
+      return;
+    }
+
+    debugPrint("✅ Code created: $code");
+
+    if (mounted) setState(() => uniqueCode = code);
+    _showMsg("Code created successfully");
+  }
+
+  Future<void> _checkSecuritySetup() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    final ref = FirebaseFirestore.instance.collection('users').doc(user.uid);
+    final doc = await ref.get();
+    if (!doc.exists) {
+      await ref.set({
+        'email': user.email,
+        'securityQuestion': null,
+        'securityAnswer': null,
+        'createdAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    }
+  }
+
+  // ================= LOST MODE =================
+
+  Future<void> _markLost() async {
+    if (deviceId == null) {
+      _showMsg("Device not initialized");
+      return;
+    }
+    if (uniqueCode == null) {
+      _showMsg("No code found");
+      return;
+    }
+
+    final controller = TextEditingController();
+    final enteredCode = await showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Activate Lost Mode"),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(hintText: "Enter your code"),
+          textCapitalization: TextCapitalization.characters,
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim().toUpperCase()),
+            child: const Text("Activate"),
+          ),
+        ],
+      ),
+    );
+
+    if (enteredCode == null || enteredCode.isEmpty) return;
+
+    final entered = enteredCode.trim().toUpperCase();
+
+    final doc = await FirebaseFirestore.instance
+        .collection('device_codes')
+        .doc(entered)
+        .get();
+
+    if (!doc.exists) {
+      _showMsg("Invalid code");
+      return;
+    }
+
+    final data = doc.data();
+    final ownerUid = data?['ownerUid'];
+
+    if (ownerUid != FirebaseAuth.instance.currentUser?.uid) {
+      _showMsg("Incorrect code");
+      return;
+    }
+
+    try {
+        // 🔥 STEP 1: Start tracking (ONLY on mobile)
+        if (!kIsWeb) {
+          bool granted = await PermissionService.setupTrackingPermissions();
+
+          if (!granted) {
+            _showMsg("Enable location permission first");
+            return;
+          }
+
+          debugPrint("🚀 Starting tracking from LOST mode");
+
+          final started = await BackgroundTracking.start(enteredCode);
+
+          if (started) {
+            _trackingStarted = true;
+            debugPrint("✅ Tracking started from LOST mode");
+          } else {
+            debugPrint("❌ Failed to start tracking");
+            _showMsg("Tracking start failed");
+            return;
+          }
+        }
+
+        // 🔥 STEP 2: Update Firestore (MUST BE INSIDE TRY)
+        await FirebaseFirestore.instance
+            .collection("device_codes")
+            .doc(enteredCode)
+            .update({"isLost": true});
+
+        // 🔥 STEP 3: Extra service (your logic)
+        await LostModeService.setLost(deviceId!, enteredCode, true);
+
+        if (!mounted) return;
+
+        _showMsg("Device marked as LOST");
+
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const TracePage()),
+        );
+
+      } catch (e) {
+        debugPrint("🔥 LOST MODE ERROR: $e");
+        _showMsg("Error activating Lost Mode");
+      }
+    }
+  void _showMsg(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    if (user == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final showCreateButton = uniqueCode == null || uniqueCode!.isEmpty;
+
+    return Scaffold(
+      backgroundColor: isDark ? const Color(0xff121212) : const Color(0xffF4F6FA),
+      
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          widget.onThemeChanged(isDark ? ThemeMode.light : ThemeMode.dark);
+        },
+        backgroundColor: Colors.blue,
+        child: Icon(isDark ? Icons.light_mode : Icons.dark_mode, color: Colors.white),
+      ),
+
+      body: SafeArea(
+        child: loading
+            ? const Center(child: CircularProgressIndicator())
+            : initError != null
+                ? Center(child: Text(initError!, textAlign: TextAlign.center))
+                : SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.fromLTRB(20, 20, 20, 30),
+                          decoration: const BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [Color(0xff3A6FE2), Color(0xff2453C5)],
+                            ),
+                            borderRadius: BorderRadius.only(
+                              bottomLeft: Radius.circular(30),
+                              bottomRight: Radius.circular(30),
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text("FinCell",
+                                      style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 26,
+                                          fontWeight: FontWeight.bold)),
+                                  SizedBox(height: 5),
+                                  Text("Lost Device Tracker",
+                                      style: TextStyle(color: Colors.white70))
+                                ],
+                              ),
+                              GestureDetector(
+                                onTap: () => Navigator.push(
+                                    context, 
+                                    MaterialPageRoute(
+                                      builder: (_) => ProfilePage(
+                                        onThemeChanged: widget.onThemeChanged,
+                                      )
+                                    )
+                                ),
+                                child: CircleAvatar(
+                                  backgroundColor: Colors.white24,
+                                  child: Text(
+                                    user.email != null && user.email!.isNotEmpty
+                                        ? user.email![0].toUpperCase()
+                                        : "U",
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                ),
+                              )
+                            ],
+                          ),
+                        ),
+
+                        const SizedBox(height: 30),
+
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 20),
+                          child: Container(
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: isDark ? const Color(0xff1E1E1E) : Colors.white,
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 10)],
+                            ),
+                            child: Column(
+                              children: [
+                                Row(
+                                  children: [
+                                    const Icon(Icons.phone_android, color: Colors.blue),
+                                    const SizedBox(width: 8),
+                                    Text("YOUR DEVICE CODE",
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          color: isDark ? Colors.white : Colors.black87,
+                                        ))
+                                  ],
+                                ),
+                                const SizedBox(height: 15),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                                  decoration: BoxDecoration(
+                                    color: isDark ? Colors.black26 : Colors.grey.shade100,
+                                    borderRadius: BorderRadius.circular(15),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Text(
+                                        showCode ? (uniqueCode ?? "---") : "••••••",
+                                        style: TextStyle(
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.bold,
+                                          letterSpacing: 3,
+                                          color: isDark ? Colors.white : Colors.black,
+                                        ),
+                                      ),
+                                      Row(
+                                        children: [
+                                          IconButton(
+                                            icon: Icon(showCode ? Icons.visibility_off : Icons.visibility, color: Colors.grey),
+                                            onPressed: _authenticateAndShowCode,
+                                          ),
+                                          IconButton(
+                                            icon: const Icon(Icons.copy, color: Colors.grey),
+                                            onPressed: (showCode && uniqueCode != null)
+                                                ? () {
+                                                    Clipboard.setData(ClipboardData(text: uniqueCode!));
+                                                    _showMsg("Code copied");
+                                                  }
+                                                : null,
+                                          ),
+                                        ],
+                                      )
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                const Text("Share this code with trusted contacts",
+                                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+                                if (showCreateButton)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 15),
+                                    child: ElevatedButton(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.blue,
+                                        foregroundColor: Colors.white,
+                                        minimumSize: const Size(double.infinity, 45),
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                      ),
+                                      onPressed: _chooseCode,
+                                      child: const Text("Create Your Code"),
+                                    ),
+                                  )
+                              ],
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 25),
+
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 20),
+                          child: SizedBox(
+                            width: double.infinity,
+                            height: 55,
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.red,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                              ),
+                              onPressed: _markLost,
+                              icon: const Icon(Icons.warning, color: Colors.white),
+                              label: const Text("Mark Device as LOST", style: TextStyle(color: Colors.white)),
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 15),
+
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 20),
+                          child: SizedBox(
+                            width: double.infinity,
+                            height: 55,
+                            child: OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                side: const BorderSide(color: Colors.blue),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                              ),
+                              onPressed: () => Navigator.push(
+                                  context, MaterialPageRoute(builder: (_) => const TracePage())),
+                              icon: const Icon(Icons.location_on, color: Colors.blue),
+                              // 🔥 FIX: Removed 'const' from Text widget because 'isDark' is a runtime variable
+                              label: Text("Trace Device Using Code", style: TextStyle(color: isDark ? Colors.white : Colors.black87)),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 50),
+                      ],
+                    ),
+                  ),
+      ),
+    );
+  }
+}
