@@ -14,7 +14,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.google.android.gms.location.*
 import com.google.firebase.Timestamp
-import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 
@@ -25,7 +24,11 @@ class LocationForegroundService : LifecycleService() {
     private lateinit var wakeLock: PowerManager.WakeLock
 
     private val db = FirebaseFirestore.getInstance()
-    private val auth = FirebaseAuth.getInstance()
+
+    private var cachedDeviceId: String? = null
+    private var cachedOwnerUid: String? = null
+    private var lastUpdateTime: Long = 0
+    private var lastCacheTime: Long = 0 // 🔥 NEW
 
     private var mediaPlayer: MediaPlayer? = null
 
@@ -43,13 +46,9 @@ class LocationForegroundService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
 
-        val rawCode = intent?.getStringExtra("code")
-        val code = rawCode?.uppercase()
-
-        Log.d("TRACKING", "🚀 Service started with code: $code")
+        val code = intent?.getStringExtra("code")?.uppercase()
 
         if (code.isNullOrEmpty()) {
-            Log.e("TRACKING", "❌ Code NULL → stopping")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -57,46 +56,14 @@ class LocationForegroundService : LifecycleService() {
         startForeground(NOTIFICATION_ID, createNotification())
 
         if (!hasLocationPermission()) {
-            Log.e("TRACKING", "❌ No location permission")
             stopSelf()
             return START_NOT_STICKY
-        }
-
-        if (!isGpsEnabled()) {
-            Log.e("TRACKING", "⚠️ GPS is OFF")
         }
 
         startLocationUpdates(code)
         listenForCommands(code)
 
         return START_STICKY
-    }
-
-    // ================= GPS =================
-
-    private fun isGpsEnabled(): Boolean {
-        val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        return manager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-    }
-
-    // ================= WAKELOCK =================
-
-    private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "FinCell::TrackingWakeLock"
-        )
-        wakeLock.acquire()
-    }
-
-    // ================= PERMISSION =================
-
-    private fun hasLocationPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            this,
-            android.Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
     }
 
     // ================= LOCATION =================
@@ -109,6 +76,7 @@ class LocationForegroundService : LifecycleService() {
         )
             .setMinUpdateIntervalMillis(2000L)
             .setMinUpdateDistanceMeters(5f)
+            .setWaitForAccurateLocation(true)
             .build()
 
         locationCallback = object : LocationCallback() {
@@ -122,65 +90,40 @@ class LocationForegroundService : LifecycleService() {
                 val accuracy = location.accuracy
                 val battery = getBatteryLevel()
 
-                Log.d("TRACKING", "📍 Lat:$lat Lng:$lng Acc:$accuracy Battery:$battery")
+                // 🔥 FILTER BAD GPS
+                if (accuracy > 30) return
 
-                // 🔥 Accept real-world GPS (don't over-filter)
-                if (accuracy > 100) {
-                    Log.d("TRACKING", "⚠️ Ignored bad accuracy: $accuracy")
-                    return
-                }
+                // 🔥 THROTTLE
+                val now = System.currentTimeMillis()
+                if (now - lastUpdateTime < 3000) return
+                lastUpdateTime = now
 
-                val updateData = hashMapOf<String, Any>(
-                    "lastLocation" to hashMapOf(
-                        "lat" to lat,
-                        "lng" to lng,
-                        "accuracy" to accuracy,
-                        "battery" to battery,
-                        "updatedAt" to Timestamp.now()
-                    ),
-                    "updatedAt" to Timestamp.now()
-                )
+                // 🔥 CACHE WITH REFRESH (FIXED)
+                if (cachedDeviceId == null || cachedOwnerUid == null || now - lastCacheTime > 60000) {
 
-                // 🔥 STEP 1: Get deviceId from device_codes
-                db.collection("device_codes")
-                    .document(code)
-                    .get()
-                    .addOnSuccessListener { doc ->
+                    db.collection("device_codes")
+                        .document(code)
+                        .get()
+                        .addOnSuccessListener { doc ->
 
-                        val deviceId = doc.getString("deviceId")
-                        val ownerUid = doc.getString("ownerUid")
+                            cachedDeviceId = doc.getString("deviceId")
+                            cachedOwnerUid = doc.getString("ownerUid")
+                            lastCacheTime = System.currentTimeMillis()
 
-                        if (deviceId == null || ownerUid == null) {
-                            Log.e("TRACKING", "❌ deviceId missing")
-                            return@addOnSuccessListener
+                            if (cachedDeviceId == null || cachedOwnerUid == null) {
+                                Log.e("TRACKING", "❌ Mapping missing")
+                                return@addOnSuccessListener
+                            }
+
+                            writeLocation(code, lat, lng, accuracy, battery)
+                        }
+                        .addOnFailureListener {
+                            Log.e("TRACKING", "❌ Mapping fetch failed: ${it.message}")
                         }
 
-                        // 🔥 STEP 2: Update LIVE location
-                        db.collection("device_codes")
-                            .document(code)
-                            .set(updateData, SetOptions.merge())
-
-                        // 🔥 STEP 3: Save HISTORY (correct path)
-                        db.collection("users")
-                            .document(ownerUid)
-                            .collection("devices")
-                            .document(deviceId)
-                            .collection("locations")
-                            .add(
-                                hashMapOf(
-                                    "lat" to lat,
-                                    "lng" to lng,
-                                    "accuracy" to accuracy,
-                                    "battery" to battery,
-                                    "timestamp" to Timestamp.now()
-                                )
-                            )
-
-                        Log.d("TRACKING", "✅ Location + History stored")
-                    }
-                    .addOnFailureListener {
-                        Log.e("TRACKING", "❌ deviceId fetch failed: ${it.message}")
-                    }
+                } else {
+                    writeLocation(code, lat, lng, accuracy, battery)
+                }
             }
         }
 
@@ -191,16 +134,70 @@ class LocationForegroundService : LifecycleService() {
         )
     }
 
+    // ================= FIRESTORE WRITE =================
+
+    private fun writeLocation(
+        code: String,
+        lat: Double,
+        lng: Double,
+        accuracy: Float,
+        battery: Int
+    ) {
+
+        val deviceId = cachedDeviceId
+        val ownerUid = cachedOwnerUid
+
+        if (deviceId == null || ownerUid == null) {
+            Log.e("TRACKING", "❌ Cache missing, skip write")
+            return
+        }
+
+        val updateData = hashMapOf<String, Any>(
+            "lastLocation" to hashMapOf(
+                "lat" to lat,
+                "lng" to lng,
+                "accuracy" to accuracy,
+                "battery" to battery,
+                "updatedAt" to Timestamp.now()
+            ),
+            "updatedAt" to Timestamp.now()
+        )
+
+        // 🔥 LIVE UPDATE
+        db.collection("device_codes")
+            .document(code)
+            .set(updateData, SetOptions.merge())
+            .addOnFailureListener {
+                Log.e("TRACKING", "🔥 Live write failed: ${it.message}")
+            }
+
+        // 🔥 HISTORY SAVE
+        db.collection("users")
+            .document(ownerUid)
+            .collection("devices")
+            .document(deviceId)
+            .collection("locations")
+            .add(
+                hashMapOf(
+                    "lat" to lat,
+                    "lng" to lng,
+                    "accuracy" to accuracy,
+                    "battery" to battery,
+                    "timestamp" to Timestamp.now()
+                )
+            )
+            .addOnFailureListener {
+                Log.e("TRACKING", "🔥 History write failed: ${it.message}")
+            }
+    }
+
     // ================= COMMAND =================
 
     private fun listenForCommands(code: String) {
-
         db.collection("device_commands")
             .document(code)
             .addSnapshotListener { snapshot, _ ->
-
                 val command = snapshot?.getString("command") ?: return@addSnapshotListener
-
                 when (command) {
                     "alarm" -> startAlarm()
                     "stop_alarm" -> stopAlarm()
@@ -230,15 +227,33 @@ class LocationForegroundService : LifecycleService() {
     // ================= BATTERY =================
 
     private fun getBatteryLevel(): Int {
-
         val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-
         val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
 
         return if (level >= 0 && scale > 0) {
             level * 100 / scale
-        } else -1
+        } else 0 // 🔥 FIXED
+    }
+
+    // ================= WAKELOCK =================
+
+    private fun acquireWakeLock() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "FinCell::TrackingWakeLock"
+        )
+        wakeLock.acquire(10 * 60 * 1000L) // 🔥 SAFE TIMEOUT
+    }
+
+    // ================= PERMISSION =================
+
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     // ================= NOTIFICATION =================
@@ -277,8 +292,6 @@ class LocationForegroundService : LifecycleService() {
         }
 
         stopAlarm()
-
-        Log.d("TRACKING", "🛑 Service destroyed")
 
         super.onDestroy()
     }

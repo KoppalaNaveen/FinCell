@@ -292,12 +292,14 @@ class _HomePageState extends State<HomePage> {
       _showMsg("Device not initialized");
       return;
     }
-    if (uniqueCode == null) {
+
+    if (uniqueCode == null || uniqueCode!.isEmpty) {
       _showMsg("No code found");
       return;
     }
 
     final controller = TextEditingController();
+
     final enteredCode = await showDialog<String>(
       context: context,
       builder: (_) => AlertDialog(
@@ -308,9 +310,15 @@ class _HomePageState extends State<HomePage> {
           textCapitalization: TextCapitalization.characters,
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
+          ),
           ElevatedButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim().toUpperCase()),
+            onPressed: () => Navigator.pop(
+              context,
+              controller.text.trim().toUpperCase(),
+            ),
             child: const Text("Activate"),
           ),
         ],
@@ -319,73 +327,62 @@ class _HomePageState extends State<HomePage> {
 
     if (enteredCode == null || enteredCode.isEmpty) return;
 
-    final entered = enteredCode.trim().toUpperCase();
+    final code = uniqueCode!.trim().toUpperCase();
 
-    final doc = await FirebaseFirestore.instance
-        .collection('device_codes')
-        .doc(entered)
-        .get();
-
-    if (!doc.exists) {
-      _showMsg("Invalid code");
-      return;
-    }
-
-    final data = doc.data();
-    final ownerUid = data?['ownerUid'];
-
-    if (ownerUid != FirebaseAuth.instance.currentUser?.uid) {
+    // ✅ VALIDATION
+    if (enteredCode != code) {
       _showMsg("Incorrect code");
       return;
     }
 
     try {
-        // 🔥 STEP 1: Start tracking (ONLY on mobile)
-        if (!kIsWeb) {
-          bool granted = await PermissionService.setupTrackingPermissions();
+      // 🔥 START TRACKING (ONLY MOBILE)
+      if (!kIsWeb) {
+        bool granted = await PermissionService.setupTrackingPermissions();
 
-          if (!granted) {
-            _showMsg("Enable location permission first");
-            return;
-          }
-
-          debugPrint("🚀 Starting tracking from LOST mode");
-
-          final started = await BackgroundTracking.start(enteredCode);
-
-          if (started) {
-            _trackingStarted = true;
-            debugPrint("✅ Tracking started from LOST mode");
-          } else {
-            debugPrint("❌ Failed to start tracking");
-            _showMsg("Tracking start failed");
-            return;
-          }
+        if (!granted) {
+          _showMsg("Enable location permission first");
+          return;
         }
 
-        // 🔥 STEP 2: Update Firestore (MUST BE INSIDE TRY)
-        await FirebaseFirestore.instance
-            .collection("device_codes")
-            .doc(enteredCode)
-            .update({"isLost": true});
+        debugPrint("🚀 Starting tracking for: $code");
 
-        // 🔥 STEP 3: Extra service (your logic)
-        await LostModeService.setLost(deviceId!, enteredCode, true);
+        final started = await BackgroundTracking.start(code);
 
-        if (!mounted) return;
+        if (!started) {
+          _showMsg("Tracking start failed");
+          return;
+        }
 
-        _showMsg("Device marked as LOST");
-
-        Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const TracePage()),
-        );
-
-      } catch (e) {
-        debugPrint("🔥 LOST MODE ERROR: $e");
-        _showMsg("Error activating Lost Mode");
+        _trackingStarted = true;
       }
+
+      // 🔥 UPDATE FIRESTORE (SAFE)
+      await FirebaseFirestore.instance
+          .collection("device_codes")
+          .doc(code)
+          .set({
+        "isLost": true,
+        "updatedAt": FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      // 🔥 OPTIONAL (your existing logic)
+      await LostModeService.setLost(deviceId!, code, true);
+
+      if (!mounted) return;
+
+      _showMsg("Device marked as LOST");
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const TracePage()),
+      );
+
+    } catch (e) {
+      debugPrint("🔥 LOST MODE ERROR: $e");
+      _showMsg("Error: $e");
     }
+  }
   void _showMsg(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));

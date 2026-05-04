@@ -11,6 +11,7 @@ class BackgroundTracking {
   // 🔥 CACHE (CRITICAL FIX)
   static String? _cachedOwnerUid;
   static String? _cachedDeviceId;
+  static int _lastWriteTime = 0;
 
   // ================= INIT LISTENER =================
   static void initializeNativeListener() {
@@ -142,14 +143,25 @@ class BackgroundTracking {
     int? battery,
   ) async {
     try {
-      debugPrint("📍 Writing location → $lat, $lng");
+      debugPrint("📍 Incoming → $lat, $lng (Acc: $accuracy)");
+
+      // 🔥 1. FILTER BAD GPS
+      if (accuracy == null || accuracy > 25) {
+        debugPrint("⚠️ Ignored low accuracy: $accuracy");
+        return;
+      }
+
+      // 🔥 2. THROTTLE WRITES (3 sec)
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastWriteTime < 3000) return;
+      _lastWriteTime = now;
 
       final codeRef = FirebaseFirestore.instance
           .collection('device_codes')
           .doc(code.toUpperCase());
 
-      // 🔥 FETCH ONLY ONCE (CACHE)
-      if (_cachedOwnerUid == null || _cachedDeviceId == null) {
+      // 🔥 3. FETCH & CACHE MAPPING
+      if (_cachedOwnerUid == null || _cachedDeviceId == null || now - _lastWriteTime > 60000) {
         final doc = await codeRef.get();
 
         if (!doc.exists) {
@@ -166,12 +178,15 @@ class BackgroundTracking {
         debugPrint("✅ Mapping cached");
       }
 
+      if (_cachedOwnerUid == null || _cachedDeviceId == null) {
+        debugPrint("❌ Mapping missing, skipping write");
+        return;
+      }
+
       final ownerUid = _cachedOwnerUid!;
       final deviceId = _cachedDeviceId!;
 
-      debugPrint("📡 Using cached UID: $ownerUid, deviceId: $deviceId");
-
-      // 🔥 WRITE HISTORY
+      // 🔥 4. WRITE HISTORY
       await FirebaseFirestore.instance
           .collection('users')
           .doc(ownerUid)
@@ -181,23 +196,25 @@ class BackgroundTracking {
           .add({
         'lat': lat,
         'lng': lng,
-        'accuracy': accuracy ?? 0,
-        'battery': battery ?? -1,
+        'accuracy': accuracy,
+        'battery': battery ?? 0,
         'timestamp': FieldValue.serverTimestamp(),
+      }).catchError((e) {
+        debugPrint("🔥 History write failed: $e");
       });
 
-      // 🔥 UPDATE LIVE LOCATION
+      // 🔥 5. UPDATE LIVE LOCATION
       await codeRef.set({
         'lastLocation': {
           'lat': lat,
           'lng': lng,
-          'accuracy': accuracy ?? 0,
-          'battery': battery ?? -1,
+          'accuracy': accuracy,
+          'battery': battery ?? 0,
           'updatedAt': FieldValue.serverTimestamp(),
         }
       }, SetOptions(merge: true));
 
-      debugPrint("✅ FIRESTORE UPDATED SUCCESSFULLY");
+      debugPrint("✅ FIRESTORE UPDATED");
 
     } catch (e) {
       debugPrint("🔥 Firestore write failed: $e");

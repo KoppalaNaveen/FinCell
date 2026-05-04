@@ -42,6 +42,9 @@ class _TracePageState extends State<TracePage> {
   LatLng? animatedDevice;
   Timer? _animationTimer;
 
+  final Distance _distanceCalc = Distance();
+  List<LatLng> pathPoints = [];
+
   @override
   void initState() {
     super.initState();
@@ -98,7 +101,7 @@ class _TracePageState extends State<TracePage> {
           }
           
           // Recalculate route & distance dynamically as YOU move
-          _recalc(); 
+          _recalc();
         });
       }, onError: (e) {
         if (mounted) setState(() => statusMessage = "GPS signal weak/offline");
@@ -153,9 +156,7 @@ class _TracePageState extends State<TracePage> {
           if (mounted) setState(() => statusMessage = "Invalid mapping");
           return;
         }
-
-        _listenToLiveLocation(ownerUid, deviceId);
-
+        
         _listenFromDeviceCode(code);
 
       }, onError: (e) {
@@ -182,10 +183,7 @@ class _TracePageState extends State<TracePage> {
         .snapshots()
         .listen((snapshot) {
 
-      if (snapshot.docs.isEmpty) {
-        
-        return;
-      }
+      if (snapshot.docs.isEmpty) return;
 
       final data = snapshot.docs.first.data() as Map<String, dynamic>;
 
@@ -196,23 +194,53 @@ class _TracePageState extends State<TracePage> {
 
       debugPrint("📡 Firestore → Lat:$lat Lng:$lng Acc:$accuracy Battery:$battery");
 
-      if (accuracy != null && accuracy > 20) {
-        debugPrint("⚠️ Skipping noisy location: $accuracy");
-        return;
-      }
-
+      // ✅ NULL CHECK FIRST (CRITICAL)
       if (lat == null || lng == null) {
         if (mounted) setState(() => statusMessage = "Invalid location data");
         return;
       }
 
+      // ✅ ACCURACY FILTER
+      if (accuracy == null || accuracy > 25) {
+        debugPrint("⚠️ Ignored low accuracy: $accuracy");
+        return;
+      }
+
       final newPos = LatLng(lat, lng);
+
+      // ✅ ANTI GPS JUMP FILTER
+      if (lostDevice != null) {
+        final jump = _distanceCalc.as(
+          LengthUnit.Meter,
+          lostDevice!,
+          newPos,
+        );
+
+        if (jump > 200) {
+          debugPrint("🚫 GPS jump ignored: $jump m");
+          return;
+        }
+      }
+
+      // ✅ PATH HISTORY
+      pathPoints.add(newPos);
 
       if (mounted) {
         setState(() {
           _animateMarker(newPos);
           lostDevice = newPos;
 
+          // ✅ DISTANCE CALCULATION
+          if (myLocation != null) {
+            final meters = _distanceCalc.as(
+              LengthUnit.Meter,
+              myLocation!,
+              newPos,
+            );
+            distance = meters;
+          }
+
+          // ✅ STATUS
           if (snapshot.metadata.isFromCache) {
             statusMessage = "Last known location (offline)";
           } else if (isLost) {
@@ -220,8 +248,6 @@ class _TracePageState extends State<TracePage> {
           } else {
             statusMessage = "Live tracking active";
           }
-
-          _recalc();
 
           if (autoFollow) {
             _mapController.move(newPos, 14.0);
@@ -241,7 +267,6 @@ class _TracePageState extends State<TracePage> {
   }
 
   void _listenFromDeviceCode(String code) {
-
     _deviceCodeSub?.cancel();
 
     _deviceCodeSub = FirebaseFirestore.instance
@@ -264,30 +289,49 @@ class _TracePageState extends State<TracePage> {
         return;
       }
 
-      final lat = (lastLocation['lat'] as num?)?.toDouble();
-      final lng = (lastLocation['lng'] as num?)?.toDouble();
-      final accuracy = (lastLocation['accuracy'] as num?)?.toDouble();
-      final battery = (lastLocation['battery'] as num?)?.toInt();
+      final double? lat = (lastLocation['lat'] as num?)?.toDouble();
+      final double? lng = (lastLocation['lng'] as num?)?.toDouble();
+      final double? accuracy = (lastLocation['accuracy'] as num?)?.toDouble();
+      final int? battery = (lastLocation['battery'] as num?)?.toInt();
 
-      if (accuracy != null && accuracy > 20) {
+      // ✅ NULL CHECK FIRST (CRITICAL)
+      if (lat == null || lng == null) return;
+
+      // ✅ ACCURACY FILTER
+      if (accuracy == null || accuracy > 25) {
         debugPrint("⚠️ Ignored low accuracy: $accuracy");
         return;
       }
 
-      if (lat == null || lng == null) return;
-
       final newPos = LatLng(lat, lng);
 
+      // ✅ ANTI GPS JUMP
       if (lostDevice != null) {
-        final dist = Geolocator.distanceBetween(
-          lostDevice!.latitude,
-          lostDevice!.longitude,
-          newPos.latitude,
-          newPos.longitude,
+        final jump = _distanceCalc.as(
+          LengthUnit.Meter,
+          lostDevice!,
+          newPos,
         );
 
-        if (dist < 5) return; // ignore noise
+        if (jump > 200) {
+          debugPrint("🚫 GPS jump ignored: $jump m");
+          return;
+        }
       }
+
+      // ✅ IGNORE VERY SMALL MOVEMENTS (NOISE)
+      if (lostDevice != null) {
+        final dist = _distanceCalc.as(
+          LengthUnit.Meter,
+          lostDevice!,
+          newPos,
+        );
+
+        if (dist < 5) return;
+      }
+
+      // ✅ PATH HISTORY
+      pathPoints.add(newPos);
 
       if (mounted) {
         setState(() {
@@ -296,25 +340,40 @@ class _TracePageState extends State<TracePage> {
 
           statusMessage = "Live tracking (direct)";
 
+          // ✅ DISTANCE CALCULATION
           if (myLocation != null) {
-            path = [myLocation!, newPos];
-          }
+            final meters = _distanceCalc.as(
+              LengthUnit.Meter,
+              myLocation!,
+              newPos,
+            );
+            distance = meters;
 
-          _recalc();
+            pathPoints.add(newPos);
+            path = pathPoints;
+
+            // keep your UI working
+
+          }
 
           if (autoFollow) {
             _mapController.move(newPos, 14.0);
           }
         });
       }
+
       debugPrint("📍 DeviceCode → Lat:$lat Lng:$lng Acc:$accuracy Battery:$battery");
+
     }, onError: (e) {
-    debugPrint("🔥 device_codes error: $e");
+      debugPrint("🔥 device_codes error: $e");
     });
   }
 
   void _animateMarker(LatLng newPosition) {
     if (animatedDevice == null) { animatedDevice = newPosition; return; }
+
+    if (_animationTimer?.isActive == true) return;
+    
     _animationTimer?.cancel();
     final start = animatedDevice!;
     int steps = 15;
@@ -330,31 +389,30 @@ class _TracePageState extends State<TracePage> {
 
   void _recalc() {
     if (lostDevice == null || myLocation == null) return;
-    
-    final double distMeters = Geolocator.distanceBetween(
-      myLocation!.latitude, 
-      myLocation!.longitude, 
-      lostDevice!.latitude, 
-      lostDevice!.longitude
+
+    final meters = _distanceCalc.as(
+      LengthUnit.Meter,
+      myLocation!,
+      lostDevice!,
     );
 
-    if (distance != null && (distMeters - distance!).abs() < 3) {
-      return;
-    }
-    
-    final double bearing = Geolocator.bearingBetween(
-      myLocation!.latitude, 
-      myLocation!.longitude, 
-      lostDevice!.latitude, 
-      lostDevice!.longitude
+    final bearing = Geolocator.bearingBetween(
+      myLocation!.latitude,
+      myLocation!.longitude,
+      lostDevice!.latitude,
+      lostDevice!.longitude,
     );
 
-    const dirs = ["North", "North-East", "East", "South-East", "South", "South-West", "West", "North-West"];
-    
+    const dirs = [
+      "North", "North-East", "East", "South-East",
+      "South", "South-West", "West", "North-West"
+    ];
+
     setState(() {
-      distance = distMeters;
+      distance = meters;
       direction = dirs[((bearing + 22.5) ~/ 45) % 8];
-      path = [myLocation!, lostDevice!]; 
+
+      path = [myLocation!, lostDevice!]; // keep your UI intact
     });
   }
 
