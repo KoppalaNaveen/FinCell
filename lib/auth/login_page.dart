@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart'; // 🔥 Required for kIsWeb
 import '../services/auth_service.dart';
 
 // 🔥 REQUIRED SERVICES
-import '../services/background_service.dart';
 import '../services/location_permission.dart';
 import '../services/device_service.dart';
 
@@ -21,7 +20,7 @@ class _LoginPageState extends State<LoginPage> {
 
   bool isLogin = true;
   bool obscurePassword = true;
-  bool isLoading = false; 
+  bool isLoading = false;
   String error = "";
 
   // Password Validation States
@@ -59,7 +58,8 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
 
-    if (!isLogin && !(hasUpper && hasLower && hasNumber && hasSpecial && hasMinLength)) {
+    if (!isLogin &&
+        !(hasUpper && hasLower && hasNumber && hasSpecial && hasMinLength)) {
       setState(() => error = "Please meet all password requirements");
       return;
     }
@@ -91,21 +91,20 @@ class _LoginPageState extends State<LoginPage> {
           });
           return;
         }
-
       } else {
         // ================= SIGNUP =================
 
         // 🔥 FIX: PREVENT DUPLICATE BEFORE CREATE
-        final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(email);
+        final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(
+          email,
+        );
         if (methods.isNotEmpty) {
           setState(() => error = "Account already exists");
           return;
         }
 
-        userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
-          email: email,
-          password: password,
-        );
+        userCredential = await FirebaseAuth.instance
+            .createUserWithEmailAndPassword(email: email, password: password);
 
         // 🔥 SEND VERIFICATION EMAIL
         await userCredential.user!.sendEmailVerification();
@@ -121,24 +120,24 @@ class _LoginPageState extends State<LoginPage> {
       final user = FirebaseAuth.instance.currentUser;
 
       if (user != null) {
-        final deviceId = await DeviceService.registerDevice();
+        await DeviceService.registerDevice();
 
         if (!kIsWeb) {
           await LocationPermissionHelper.request();
-
-          if (deviceId != null) {
-            await BackgroundTracking.start(deviceId);
-          }
         }
       }
-
     } on FirebaseAuthException catch (e) {
       setState(() {
-        if (e.code == 'user-not-found') error = "No user found for that email.";
-        else if (e.code == 'wrong-password') error = "Wrong password provided.";
-        else if (e.code == 'invalid-email') error = "Invalid email format.";
-        else if (e.code == 'email-already-in-use') error = "Account already exists.";
-        else error = e.message ?? "Authentication error";
+        if (e.code == 'user-not-found')
+          error = "No user found for that email.";
+        else if (e.code == 'wrong-password')
+          error = "Wrong password provided.";
+        else if (e.code == 'invalid-email')
+          error = "Invalid email format.";
+        else if (e.code == 'email-already-in-use')
+          error = "Account already exists.";
+        else
+          error = e.message ?? "Authentication error";
       });
     } catch (e) {
       setState(() => error = "An unexpected error occurred.");
@@ -159,12 +158,9 @@ class _LoginPageState extends State<LoginPage> {
       final user = await AuthService().signInWithGoogle();
 
       if (user != null) {
-        final deviceId = await DeviceService.registerDevice();
+        await DeviceService.registerDevice();
         if (!kIsWeb) {
           await LocationPermissionHelper.request();
-          if (deviceId != null) {
-            await BackgroundTracking.start(deviceId);
-          }
         }
       }
     } catch (e) {
@@ -196,11 +192,18 @@ class _LoginPageState extends State<LoginPage> {
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
         children: [
-          Icon(valid ? Icons.check_circle : Icons.circle, size: 14, color: valid ? Colors.green : Colors.grey),
+          Icon(
+            valid ? Icons.check_circle : Icons.circle,
+            size: 14,
+            color: valid ? Colors.green : Colors.grey,
+          ),
           const SizedBox(width: 8),
           Text(
             text,
-            style: TextStyle(color: valid ? Colors.green : Colors.black87, fontSize: 12), // 🔥 Black text
+            style: TextStyle(
+              color: valid ? Colors.green : Colors.black87,
+              fontSize: 12,
+            ), // 🔥 Black text
           ),
         ],
       ),
@@ -215,7 +218,9 @@ class _LoginPageState extends State<LoginPage> {
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(30),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 400), // 🔥 Keeps UI clean on Web
+            constraints: const BoxConstraints(
+              maxWidth: 400,
+            ), // 🔥 Keeps UI clean on Web
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
@@ -224,13 +229,21 @@ class _LoginPageState extends State<LoginPage> {
                   'assets/icon/fincell_icon.png',
                   height: 100,
                   errorBuilder: (context, error, stackTrace) {
-                    return const Icon(Icons.phone_android, size: 80, color: Colors.blue);
+                    return const Icon(
+                      Icons.phone_android,
+                      size: 80,
+                      color: Colors.blue,
+                    );
                   },
                 ),
                 const SizedBox(height: 10),
                 const Text(
                   "FinCell",
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.black87), // 🔥 Black
+                  style: TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black87,
+                  ), // 🔥 Black
                 ),
                 const Text(
                   "Lost Device Tracker",
@@ -242,7 +255,11 @@ class _LoginPageState extends State<LoginPage> {
                   alignment: Alignment.centerLeft,
                   child: Text(
                     isLogin ? "Login" : "Create Account",
-                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.black), // 🔥 Black
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.black,
+                    ), // 🔥 Black
                   ),
                 ),
                 const SizedBox(height: 20),
@@ -251,12 +268,19 @@ class _LoginPageState extends State<LoginPage> {
                 TextField(
                   controller: _emailController,
                   keyboardType: TextInputType.emailAddress,
-                  style: const TextStyle(color: Colors.black), // 🔥 Input text black
+                  style: const TextStyle(
+                    color: Colors.black,
+                  ), // 🔥 Input text black
                   decoration: InputDecoration(
                     labelText: "Email address",
                     labelStyle: const TextStyle(color: Colors.black54),
-                    prefixIcon: const Icon(Icons.email_outlined, color: Colors.blue),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                    prefixIcon: const Icon(
+                      Icons.email_outlined,
+                      color: Colors.blue,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                       borderSide: const BorderSide(color: Colors.black26),
@@ -270,19 +294,32 @@ class _LoginPageState extends State<LoginPage> {
                   controller: _passwordController,
                   obscureText: obscurePassword,
                   onChanged: _validatePassword,
-                  style: const TextStyle(color: Colors.black), // 🔥 Input text black
+                  style: const TextStyle(
+                    color: Colors.black,
+                  ), // 🔥 Input text black
                   decoration: InputDecoration(
                     labelText: isLogin ? "Password" : "Create password",
                     labelStyle: const TextStyle(color: Colors.black54),
-                    prefixIcon: const Icon(Icons.lock_outline, color: Colors.blue),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                    prefixIcon: const Icon(
+                      Icons.lock_outline,
+                      color: Colors.blue,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                       borderSide: const BorderSide(color: Colors.black26),
                     ),
                     suffixIcon: IconButton(
-                      icon: Icon(obscurePassword ? Icons.visibility : Icons.visibility_off, color: Colors.grey),
-                      onPressed: () => setState(() => obscurePassword = !obscurePassword),
+                      icon: Icon(
+                        obscurePassword
+                            ? Icons.visibility
+                            : Icons.visibility_off,
+                        color: Colors.grey,
+                      ),
+                      onPressed: () =>
+                          setState(() => obscurePassword = !obscurePassword),
                     ),
                   ),
                 ),
@@ -299,7 +336,14 @@ class _LoginPageState extends State<LoginPage> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text("Requirements:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.black)),
+                        const Text(
+                          "Requirements:",
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                            color: Colors.black,
+                          ),
+                        ),
                         const SizedBox(height: 6),
                         _rule("At least 6 characters", hasMinLength),
                         _rule("One uppercase letter", hasUpper),
@@ -315,7 +359,14 @@ class _LoginPageState extends State<LoginPage> {
                 if (error.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 12),
-                    child: Text(error, style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.w500)),
+                    child: Text(
+                      error,
+                      style: const TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
                   ),
 
                 // SUBMIT BUTTON
@@ -324,15 +375,30 @@ class _LoginPageState extends State<LoginPage> {
                   height: 52,
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       backgroundColor: const Color(0xff1E88E5),
                       foregroundColor: Colors.white,
                       elevation: 0,
                     ),
                     onPressed: isLoading ? null : _submit,
-                    child: isLoading 
-                      ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                      : Text(isLogin ? "Login" : "Register", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    child: isLoading
+                        ? const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : Text(
+                            isLogin ? "Login" : "Register",
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
                   ),
                 ),
 
@@ -341,22 +407,43 @@ class _LoginPageState extends State<LoginPage> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text(isLogin ? "New user?" : "Already have an account?", style: const TextStyle(color: Colors.black54)),
+                    Text(
+                      isLogin ? "New user?" : "Already have an account?",
+                      style: const TextStyle(color: Colors.black54),
+                    ),
                     TextButton(
-                      onPressed: () => setState(() { isLogin = !isLogin; error = ""; }),
-                      child: Text(isLogin ? "Create account" : "Login", style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xff1E88E5))),
+                      onPressed: () => setState(() {
+                        isLogin = !isLogin;
+                        error = "";
+                      }),
+                      child: Text(
+                        isLogin ? "Create account" : "Login",
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xff1E88E5),
+                        ),
+                      ),
                     ),
                   ],
                 ),
 
                 if (isLogin)
-                  TextButton(onPressed: _forgotPassword, child: const Text("Forgot Password?", style: TextStyle(color: Colors.black45))),
+                  TextButton(
+                    onPressed: _forgotPassword,
+                    child: const Text(
+                      "Forgot Password?",
+                      style: TextStyle(color: Colors.black45),
+                    ),
+                  ),
 
                 const SizedBox(height: 20),
                 const Row(
                   children: [
                     Expanded(child: Divider()),
-                    Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text("OR", style: TextStyle(color: Colors.grey))),
+                    Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 12),
+                      child: Text("OR", style: TextStyle(color: Colors.grey)),
+                    ),
                     Expanded(child: Divider()),
                   ],
                 ),
@@ -368,11 +455,23 @@ class _LoginPageState extends State<LoginPage> {
                   height: 52,
                   child: OutlinedButton.icon(
                     style: OutlinedButton.styleFrom(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                       side: const BorderSide(color: Colors.black12),
                     ),
-                    icon: const Icon(Icons.login_rounded, size: 20, color: Colors.blueAccent),
-                    label: const Text("Continue with Google", style: TextStyle(color: Colors.black87, fontWeight: FontWeight.w500)),
+                    icon: const Icon(
+                      Icons.login_rounded,
+                      size: 20,
+                      color: Colors.blueAccent,
+                    ),
+                    label: const Text(
+                      "Continue with Google",
+                      style: TextStyle(
+                        color: Colors.black87,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
                     onPressed: isLoading ? null : _googleLogin,
                   ),
                 ),

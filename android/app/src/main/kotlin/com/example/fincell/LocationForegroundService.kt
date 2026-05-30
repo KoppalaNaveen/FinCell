@@ -15,16 +15,19 @@ import androidx.lifecycle.LifecycleService
 import com.google.android.gms.location.*
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.SetOptions
 
 class LocationForegroundService : LifecycleService() {
 
     private lateinit var fusedClient: FusedLocationProviderClient
     private var locationCallback: LocationCallback? = null
+    private var commandListener: ListenerRegistration? = null
     private lateinit var wakeLock: PowerManager.WakeLock
 
     private val db = FirebaseFirestore.getInstance()
 
+    private var cachedCode: String? = null
     private var cachedDeviceId: String? = null
     private var cachedOwnerUid: String? = null
     private var lastUpdateTime: Long = 0
@@ -69,6 +72,17 @@ class LocationForegroundService : LifecycleService() {
     // ================= LOCATION =================
 
     private fun startLocationUpdates(code: String) {
+        locationCallback?.let {
+            fusedClient.removeLocationUpdates(it)
+        }
+
+        if (cachedCode != code) {
+            cachedCode = code
+            cachedDeviceId = null
+            cachedOwnerUid = null
+            lastCacheTime = 0
+            lastUpdateTime = 0
+        }
 
         val request = LocationRequest.Builder(
             Priority.PRIORITY_HIGH_ACCURACY,
@@ -91,7 +105,7 @@ class LocationForegroundService : LifecycleService() {
                 val battery = getBatteryLevel()
 
                 // 🔥 FILTER BAD GPS
-                if (accuracy > 30) return
+                if (accuracy > 100) return
 
                 // 🔥 THROTTLE
                 val now = System.currentTimeMillis()
@@ -108,6 +122,7 @@ class LocationForegroundService : LifecycleService() {
 
                             cachedDeviceId = doc.getString("deviceId")
                             cachedOwnerUid = doc.getString("ownerUid")
+                            cachedCode = code
                             lastCacheTime = System.currentTimeMillis()
 
                             if (cachedDeviceId == null || cachedOwnerUid == null) {
@@ -194,7 +209,8 @@ class LocationForegroundService : LifecycleService() {
     // ================= COMMAND =================
 
     private fun listenForCommands(code: String) {
-        db.collection("device_commands")
+        commandListener?.remove()
+        commandListener = db.collection("device_commands")
             .document(code)
             .addSnapshotListener { snapshot, _ ->
                 val command = snapshot?.getString("command") ?: return@addSnapshotListener
@@ -286,6 +302,9 @@ class LocationForegroundService : LifecycleService() {
         locationCallback?.let {
             fusedClient.removeLocationUpdates(it)
         }
+
+        commandListener?.remove()
+        commandListener = null
 
         if (::wakeLock.isInitialized && wakeLock.isHeld) {
             wakeLock.release()

@@ -1,17 +1,20 @@
-import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:geolocator/geolocator.dart';
 
 class BackgroundTracking {
-  static const MethodChannel _channel =
-      MethodChannel('fincell_service_channel');
+  static const MethodChannel _channel = MethodChannel(
+    'fincell_service_channel',
+  );
 
   static bool _listenerInitialized = false;
 
-  // 🔥 CACHE (CRITICAL FIX)
+  static String? _cachedCode;
   static String? _cachedOwnerUid;
   static String? _cachedDeviceId;
   static int _lastWriteTime = 0;
+  static int _lastCacheTime = 0;
 
   // ================= INIT LISTENER =================
   static void initializeNativeListener() {
@@ -19,17 +22,17 @@ class BackgroundTracking {
 
     _listenerInitialized = true;
 
-    debugPrint("🚀 Initializing Native Listener...");
+    debugPrint("Initializing native tracking listener...");
 
     _channel.setMethodCallHandler((call) async {
-      debugPrint("🔥 METHOD CALLED: ${call.method}");
+      debugPrint("Native method called: ${call.method}");
 
       if (call.method == "onLocationUpdate") {
         try {
           final args = call.arguments;
 
           if (args == null) {
-            debugPrint("❌ Null args from native");
+            debugPrint("Null args from native");
             return;
           }
 
@@ -39,63 +42,67 @@ class BackgroundTracking {
           final double? accuracy = (args['accuracy'] as num?)?.toDouble();
           final int? battery = (args['battery'] as num?)?.toInt();
 
-          debugPrint("📡 RAW DATA → $args");
+          debugPrint("Raw native location data: $args");
 
           if (code == null || lat == null || lng == null) {
-            debugPrint("❌ Invalid location data");
+            debugPrint("Invalid location data");
             return;
           }
 
-          await _sendLocationToFirestore(
-            code,
-            lat,
-            lng,
-            accuracy,
-            battery,
-          );
-
-          debugPrint("✅ LOCATION PROCESSED");
-
+          await _sendLocationToFirestore(code, lat, lng, accuracy, battery);
         } catch (e) {
-          debugPrint("🔥 Listener error: $e");
+          debugPrint("Listener error: $e");
         }
       }
     });
-
-    debugPrint("✅ Native listener initialized");
   }
 
   // ================= START TRACKING =================
   static Future<bool> start(String code) async {
     if (kIsWeb) return false;
 
-    if (code.isEmpty) {
-      debugPrint("❌ Invalid tracking code");
-      return false;
-    }
+    final normalizedCode = code.trim().toUpperCase();
+    if (normalizedCode.isEmpty) return false;
 
     try {
-      initializeNativeListener();
+      _resetCacheIfCodeChanged(normalizedCode);
 
-      final upperCode = code.toUpperCase();
+      final codeRef = FirebaseFirestore.instance
+          .collection("device_codes")
+          .doc(normalizedCode);
 
-      final bool result = await _channel.invokeMethod('startService', {
-        "code": upperCode,
-      });
-
-      if (result) {
-        debugPrint("✅ Service started for code: $upperCode");
-
-        // 🔥 RESET CACHE WHEN NEW SESSION STARTS
-        _cachedOwnerUid = null;
-        _cachedDeviceId = null;
-
-        await _updateTrackingStatus(upperCode, true);
+      final codeDoc = await codeRef.get();
+      if (!codeDoc.exists) {
+        debugPrint("Tracking start failed: code not found: $normalizedCode");
+        return false;
       }
 
-      return result;
+      await _updateTrackingStatus(normalizedCode, true);
+
+      try {
+        final position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation,
+        );
+
+        await _sendLocationToFirestore(
+          normalizedCode,
+          position.latitude,
+          position.longitude,
+          position.accuracy,
+          null,
+        );
+      } catch (e) {
+        debugPrint("Immediate GPS fix skipped: $e");
+      }
+
+      final result = await _channel.invokeMethod('startService', {
+        'code': normalizedCode,
+      });
+
+      debugPrint("Native tracking ensured: $result");
+      return true;
     } catch (e) {
-      debugPrint("🔥 Start service error: $e");
+      debugPrint("Tracking start error: $e");
       return false;
     }
   }
@@ -105,32 +112,28 @@ class BackgroundTracking {
     if (kIsWeb) return false;
 
     try {
-      final bool result = await _channel.invokeMethod('stopService');
-
-      if (result) {
-        await _updateTrackingStatus(code, false);
-      }
-
-      return result;
+      final result = await _channel.invokeMethod('stopService');
+      await _updateTrackingStatus(code, false);
+      _resetCache();
+      return result != null;
     } catch (e) {
-      debugPrint("🔥 Stop service error: $e");
+      debugPrint("Stop service error: $e");
       return false;
     }
   }
 
   // ================= STATUS UPDATE =================
-  static Future<void> _updateTrackingStatus(
-      String code, bool isActive) async {
+  static Future<void> _updateTrackingStatus(String code, bool isActive) async {
     try {
       await FirebaseFirestore.instance
           .collection('device_codes')
           .doc(code.toUpperCase())
-          .update({
-        'isLost': isActive,
-        'lastUpdated': FieldValue.serverTimestamp(),
-      });
+          .set({
+            'isLost': isActive,
+            'lastUpdated': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
     } catch (e) {
-      debugPrint("🔥 Status update error: $e");
+      debugPrint("Status update error: $e");
     }
   }
 
@@ -143,29 +146,37 @@ class BackgroundTracking {
     int? battery,
   ) async {
     try {
-      debugPrint("📍 Incoming → $lat, $lng (Acc: $accuracy)");
+      final normalizedCode = code.trim().toUpperCase();
+      _resetCacheIfCodeChanged(normalizedCode);
 
-      // 🔥 1. FILTER BAD GPS
-      if (accuracy == null || accuracy > 25) {
-        debugPrint("⚠️ Ignored low accuracy: $accuracy");
+      debugPrint("Incoming location: $lat, $lng (accuracy: $accuracy)");
+
+      if (!_isValidCoordinate(lat, lng)) {
+        debugPrint("Invalid coordinate ignored");
         return;
       }
 
-      // 🔥 2. THROTTLE WRITES (3 sec)
+      // Keep slightly weak indoor fixes instead of freezing the map forever.
+      if (accuracy != null && accuracy > 100) {
+        debugPrint("Unusable low-accuracy fix ignored: $accuracy");
+        return;
+      }
+
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _lastWriteTime < 3000) return;
       _lastWriteTime = now;
 
       final codeRef = FirebaseFirestore.instance
           .collection('device_codes')
-          .doc(code.toUpperCase());
+          .doc(normalizedCode);
 
-      // 🔥 3. FETCH & CACHE MAPPING
-      if (_cachedOwnerUid == null || _cachedDeviceId == null || now - _lastWriteTime > 60000) {
+      if (_cachedOwnerUid == null ||
+          _cachedDeviceId == null ||
+          now - _lastCacheTime > 60000) {
         final doc = await codeRef.get();
 
         if (!doc.exists) {
-          debugPrint("❌ Code not found");
+          debugPrint("Code not found");
           return;
         }
 
@@ -174,36 +185,38 @@ class BackgroundTracking {
 
         _cachedOwnerUid = data['ownerUid'];
         _cachedDeviceId = data['deviceId'];
+        _cachedCode = normalizedCode;
+        _lastCacheTime = now;
 
-        debugPrint("✅ Mapping cached");
+        debugPrint("Tracking mapping cached");
       }
 
       if (_cachedOwnerUid == null || _cachedDeviceId == null) {
-        debugPrint("❌ Mapping missing, skipping write");
+        debugPrint("Mapping missing, skipping write");
         return;
       }
 
       final ownerUid = _cachedOwnerUid!;
       final deviceId = _cachedDeviceId!;
 
-      // 🔥 4. WRITE HISTORY
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(ownerUid)
-          .collection('devices')
-          .doc(deviceId)
-          .collection('locations')
-          .add({
-        'lat': lat,
-        'lng': lng,
-        'accuracy': accuracy,
-        'battery': battery ?? 0,
-        'timestamp': FieldValue.serverTimestamp(),
-      }).catchError((e) {
-        debugPrint("🔥 History write failed: $e");
-      });
+      try {
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(ownerUid)
+            .collection('devices')
+            .doc(deviceId)
+            .collection('locations')
+            .add({
+              'lat': lat,
+              'lng': lng,
+              'accuracy': accuracy,
+              'battery': battery ?? 0,
+              'timestamp': FieldValue.serverTimestamp(),
+            });
+      } catch (e) {
+        debugPrint("History write failed: $e");
+      }
 
-      // 🔥 5. UPDATE LIVE LOCATION
       await codeRef.set({
         'lastLocation': {
           'lat': lat,
@@ -211,14 +224,31 @@ class BackgroundTracking {
           'accuracy': accuracy,
           'battery': battery ?? 0,
           'updatedAt': FieldValue.serverTimestamp(),
-        }
+        },
+        'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
 
-      debugPrint("✅ FIRESTORE UPDATED");
-
+      debugPrint("Firestore location updated");
     } catch (e) {
-      debugPrint("🔥 Firestore write failed: $e");
+      debugPrint("Firestore write failed: $e");
     }
+  }
+
+  static bool _isValidCoordinate(double lat, double lng) {
+    return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+  }
+
+  static void _resetCacheIfCodeChanged(String code) {
+    if (_cachedCode == code) return;
+    _resetCache();
+  }
+
+  static void _resetCache() {
+    _cachedCode = null;
+    _cachedOwnerUid = null;
+    _cachedDeviceId = null;
+    _lastCacheTime = 0;
+    _lastWriteTime = 0;
   }
 
   // ================= BATTERY OPT =================
@@ -227,7 +257,7 @@ class BackgroundTracking {
     try {
       await _channel.invokeMethod('requestBatteryOptimization');
     } catch (e) {
-      debugPrint("🔥 Battery optimization error: $e");
+      debugPrint("Battery optimization error: $e");
     }
   }
 
@@ -237,7 +267,7 @@ class BackgroundTracking {
     try {
       await _channel.invokeMethod('hideApp');
     } catch (e) {
-      debugPrint("🔥 Hide app error: $e");
+      debugPrint("Hide app error: $e");
     }
   }
 
@@ -246,7 +276,7 @@ class BackgroundTracking {
     try {
       await _channel.invokeMethod('showApp');
     } catch (e) {
-      debugPrint("🔥 Show app error: $e");
+      debugPrint("Show app error: $e");
     }
   }
 }

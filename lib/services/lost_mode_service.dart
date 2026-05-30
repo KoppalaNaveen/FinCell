@@ -4,19 +4,15 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
 class LostModeService {
-
   static final FirebaseFirestore _db = FirebaseFirestore.instance;
 
-  static const MethodChannel _channel =
-      MethodChannel("lost_tracking_channel");
+  static const MethodChannel _channel = MethodChannel(
+    "fincell_service_channel",
+  );
 
   // ================= SET LOST =================
 
-  static Future<void> setLost(
-      String deviceId,
-      String code,
-      bool isLost) async {
-
+  static Future<void> setLost(String deviceId, String code, bool isLost) async {
     final user = FirebaseAuth.instance.currentUser;
 
     if (user == null) {
@@ -27,10 +23,11 @@ class LostModeService {
 
     code = code.trim().toUpperCase();
 
-    debugPrint("🔥 LOST MODE → code: $code, deviceId: $deviceId, isLost: $isLost");
+    debugPrint(
+      "🔥 LOST MODE → code: $code, deviceId: $deviceId, isLost: $isLost",
+    );
 
     try {
-
       // ================= STEP 1 — VALIDATE CODE =================
 
       final codeRef = _db.collection('device_codes').doc(code);
@@ -74,41 +71,31 @@ class LostModeService {
           .collection('devices')
           .doc(deviceId)
           .set({
-        'isLost': isLost,
-        'activeCode': code,
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+            'isLost': isLost,
+            'activeCode': code,
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
 
       debugPrint("✅ user device updated");
 
       // ================= STEP 5 — START / STOP SERVICE =================
 
       try {
-
         if (isLost) {
-
           debugPrint("🚀 Starting native tracking service");
 
-          await _channel.invokeMethod("startService", {
-            "code": code,
-          });
-
+          await _channel.invokeMethod("startService", {"code": code});
         } else {
-
           debugPrint("🛑 Stopping native tracking service");
 
           await _channel.invokeMethod("stopService");
         }
-
       } catch (e) {
-
         debugPrint("❌ Native service error: $e");
 
         // ❗ DO NOT crash app
       }
-
     } catch (e) {
-
       debugPrint("❌ LOST MODE ERROR: $e");
 
       throw Exception("Lost mode update failed: $e");

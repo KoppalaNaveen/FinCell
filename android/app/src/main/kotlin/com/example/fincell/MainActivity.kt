@@ -45,11 +45,6 @@ class MainActivity : FlutterFragmentActivity() {
 
                         val isRunning = prefs.getBoolean("is_lost", false)
 
-                        if (isRunning) {
-                            result.success("Service already running")
-                            return@setMethodCallHandler
-                        }
-
                         prefs.edit()
                             .putBoolean("is_lost", true)
                             .putString("device_code", code)
@@ -57,7 +52,7 @@ class MainActivity : FlutterFragmentActivity() {
 
                         startTrackingService(code)
 
-                        result.success("Service Started")
+                        result.success(if (isRunning) "Service Ensured" else "Service Started")
 
                     } catch (e: Exception) {
 
