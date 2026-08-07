@@ -11,10 +11,9 @@ class NetworkReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
 
         val prefs = context.getSharedPreferences("fincell_prefs", Context.MODE_PRIVATE)
-        val isLost = prefs.getBoolean("is_lost", false)
         val code = prefs.getString("device_code", null)
 
-        if (!isLost || code.isNullOrEmpty()) return
+        if (code.isNullOrEmpty()) return
 
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = cm.activeNetworkInfo

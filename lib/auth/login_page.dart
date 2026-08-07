@@ -93,25 +93,17 @@ class _LoginPageState extends State<LoginPage> {
         }
       } else {
         // ================= SIGNUP =================
-
-        // 🔥 FIX: PREVENT DUPLICATE BEFORE CREATE
-        final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(
-          email,
-        );
-        if (methods.isNotEmpty) {
-          setState(() => error = "Account already exists");
-          return;
-        }
-
         userCredential = await FirebaseAuth.instance
             .createUserWithEmailAndPassword(email: email, password: password);
 
         // 🔥 SEND VERIFICATION EMAIL
         await userCredential.user!.sendEmailVerification();
 
-        setState(() {
-          error = "Verification email sent. Check your inbox.";
-        });
+        if (mounted) {
+          setState(() {
+            error = "Verification email sent. Check your inbox.";
+          });
+        }
 
         return;
       }
@@ -127,20 +119,25 @@ class _LoginPageState extends State<LoginPage> {
         }
       }
     } on FirebaseAuthException catch (e) {
-      setState(() {
-        if (e.code == 'user-not-found')
-          error = "No user found for that email.";
-        else if (e.code == 'wrong-password')
-          error = "Wrong password provided.";
-        else if (e.code == 'invalid-email')
-          error = "Invalid email format.";
-        else if (e.code == 'email-already-in-use')
-          error = "Account already exists.";
-        else
-          error = e.message ?? "Authentication error";
-      });
+      if (mounted) {
+        setState(() {
+          if (e.code == 'user-not-found') {
+            error = "No user found for that email.";
+          } else if (e.code == 'wrong-password') {
+            error = "Wrong password provided.";
+          } else if (e.code == 'invalid-email') {
+            error = "Invalid email format.";
+          } else if (e.code == 'email-already-in-use') {
+            error = "Account already exists.";
+          } else {
+            error = e.message ?? "Authentication error";
+          }
+        });
+      }
     } catch (e) {
-      setState(() => error = "An unexpected error occurred.");
+      if (mounted) {
+        setState(() => error = "An unexpected error occurred.");
+      }
     } finally {
       if (mounted) setState(() => isLoading = false);
     }
@@ -330,7 +327,7 @@ class _LoginPageState extends State<LoginPage> {
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: Colors.blue.withOpacity(0.05),
+                      color: Colors.blue.withValues(alpha: 0.05),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Column(

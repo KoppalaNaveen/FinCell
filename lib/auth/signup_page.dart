@@ -39,16 +39,20 @@ class _SignupPageState extends State<SignupPage> {
 
       await FirebaseAuth.instance.signOut();
 
-      Navigator.pop(context); // go back to login
-
+      if (mounted) {
+        Navigator.pop(context); // go back to login
+      }
     } catch (e) {
       _showMsg("Signup failed: $e");
     }
 
-    setState(() => loading = false);
+    if (mounted) {
+      setState(() => loading = false);
+    }
   }
 
   void _showMsg(String msg) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
   }

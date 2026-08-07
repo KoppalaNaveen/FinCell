@@ -58,7 +58,7 @@ class LostModeService {
         'updatedAt': FieldValue.serverTimestamp(),
 
         // 🔥 ENSURE STRUCTURE EXISTS
-        'lastLocation': data['lastLocation'] ?? null,
+        'lastLocation': data['lastLocation'],
       }, SetOptions(merge: true));
 
       debugPrint("✅ device_codes updated");
@@ -77,6 +77,15 @@ class LostModeService {
           }, SetOptions(merge: true));
 
       debugPrint("✅ user device updated");
+
+      // ================= STEP 4.5 — INITIALIZE COMMANDS =================
+      await _db.collection('device_commands').doc(code).set({
+        'playSound': false,
+        'stopSound': true,
+        'command': 'idle',
+        'status': 'idle',
+        'timestamp': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
 
       // ================= STEP 5 — START / STOP SERVICE =================
 

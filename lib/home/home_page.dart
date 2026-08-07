@@ -3,12 +3,14 @@ import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:local_auth/local_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 
 import '../services/device_service.dart';
 import '../services/permission_service.dart';
 import '../services/code_service.dart';
 import '../services/background_service.dart';
+import '../services/location_service.dart';
 
 import 'package:flutter/foundation.dart';
 
@@ -24,7 +26,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String? deviceId;
   String? uniqueCode;
 
@@ -32,6 +34,7 @@ class _HomePageState extends State<HomePage> {
   String? initError;
 
   bool _trackingStarted = false;
+  bool _creatingCode = false;
 
   final LocalAuthentication auth = LocalAuthentication();
   bool showCode = false;
@@ -43,43 +46,50 @@ class _HomePageState extends State<HomePage> {
   bool _trackingStartInProgress = false;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    if (!kIsWeb) {
+      BackgroundTracking.initializeNativeListener();
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initApp();
+      _handlePermissions();
+    });
+
+    Future.delayed(const Duration(seconds: 1), () async {
+      if (!kIsWeb && uniqueCode != null && uniqueCode!.isNotEmpty) {
+        try {
+          final started = await BackgroundTracking.start(uniqueCode!);
+          if (started) _trackingStarted = true;
+        } catch (e) {
+          debugPrint("Auto-start tracking notice: $e");
+        }
+      }
+    });
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     hideTimer?.cancel();
     _userListener?.cancel();
     _deviceCodeListener?.cancel();
     super.dispose();
   }
 
-  // 🔥 STEP 2: ADD HERE
-  Future<void> _handlePermissions() async {
-    if (kIsWeb) return;
-
-    bool granted = await PermissionService.setupTrackingPermissions();
-    if (!granted) {
-      _showPermissionDialog();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !kIsWeb) {
+      PermissionService.requestLocationPermissionsProperly(context);
     }
   }
 
-  // 🔥 STEP 3: ADD HERE
-  void _showPermissionDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        title: const Text("Permission Required"),
-        content: const Text(
-          "Location permission is required to track your device.\n\nPlease allow it to continue.",
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context); // 🔥 ONLY CLOSE DIALOG
-            },
-            child: const Text("OK"),
-          ),
-        ],
-      ),
-    );
+  Future<void> _handlePermissions() async {
+    if (kIsWeb) return;
+    await PermissionService.setupTrackingPermissions(context);
   }
 
   // ================= AUTH =================
@@ -123,73 +133,67 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  @override
-  void initState() {
-    super.initState();
-
-    if (!kIsWeb) {
-      BackgroundTracking.initializeNativeListener();
-    }
-
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await _handlePermissions();
-      await _initApp();
-    });
-    Future.delayed(const Duration(seconds: 3), () async {
-      if (!kIsWeb && uniqueCode != null) {
-        final doc = await FirebaseFirestore.instance
-            .collection('device_codes')
-            .doc(uniqueCode!)
-            .get();
-
-        final isLost = doc.data()?['isLost'] ?? false;
-
-        if (isLost) {
-          debugPrint("🔁 Auto-restarting tracking...");
-          final started = await BackgroundTracking.start(uniqueCode!);
-          if (started) _trackingStarted = true;
-        }
-      }
-    });
-  }
-
   // ================= INIT =================
 
   Future<void> _initApp() async {
     try {
-      // 🔥 DO NOT request permissions again here
-      // Already handled in _handlePermissions()
-
-      deviceId = await DeviceService.registerDevice();
-      if (deviceId == null) throw Exception("Device registration failed");
-
       final uid = FirebaseAuth.instance.currentUser?.uid;
+      final prefs = await SharedPreferences.getInstance();
+
+      final cachedCode =
+          prefs.getString('uniqueCode') ??
+          (uid != null ? prefs.getString('cached_code_$uid') : null);
+
+      if (cachedCode != null && cachedCode.isNotEmpty && mounted) {
+        setState(() {
+          uniqueCode = cachedCode;
+        });
+        _listenToActiveDeviceCode(cachedCode);
+      }
+
+      deviceId = await DeviceService.registerDevice().timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
+      );
 
       if (uid != null) {
+        _userListener?.cancel();
         _userListener = FirebaseFirestore.instance
             .collection('users')
             .doc(uid)
             .snapshots()
-            .listen((doc) {
-              if (!doc.exists || !mounted) return;
+            .listen(
+              (doc) async {
+                if (!doc.exists || !mounted) return;
 
-              final data = doc.data();
-              final code = data?['uniqueCode'];
-              final nextCode = (code != null && code.toString().isNotEmpty)
-                  ? code.toString().trim().toUpperCase()
-                  : null;
+                final data = doc.data();
+                final code = data?['uniqueCode'];
+                final nextCode = (code != null && code.toString().isNotEmpty)
+                    ? code.toString().trim().toUpperCase()
+                    : null;
 
-              setState(() {
-                uniqueCode = nextCode;
-              });
+                if (nextCode != null) {
+                  await prefs.setString('uniqueCode', nextCode);
+                  await prefs.setString('cached_code_$uid', nextCode);
+                }
 
-              _listenToActiveDeviceCode(nextCode);
-            });
+                if (mounted) {
+                  setState(() {
+                    uniqueCode = nextCode;
+                  });
+                }
+
+                _listenToActiveDeviceCode(nextCode);
+              },
+              onError: (e) {
+                debugPrint("User listener error: $e");
+              },
+            );
       }
 
-      await _checkSecuritySetup();
+      unawaited(_checkSecuritySetup());
     } catch (e) {
-      initError = e.toString();
+      debugPrint("Init error: $e");
     } finally {
       if (mounted) {
         setState(() => loading = false);
@@ -202,6 +206,7 @@ class _HomePageState extends State<HomePage> {
 
     if (_trackingStarted && _observedCode != null && !kIsWeb) {
       unawaited(BackgroundTracking.stop(_observedCode!));
+      LocationService().stopTracking();
     }
 
     _deviceCodeListener?.cancel();
@@ -209,7 +214,10 @@ class _HomePageState extends State<HomePage> {
     _trackingStarted = false;
     _trackingStartInProgress = false;
 
-    if (code == null || code.isEmpty || kIsWeb) return;
+    if (code == null || code.isEmpty) return;
+
+    // Start continuous tracking & command listeners for active device code
+    _ensureTrackingActiveForCode(code);
 
     _deviceCodeListener = FirebaseFirestore.instance
         .collection('device_codes')
@@ -221,36 +229,34 @@ class _HomePageState extends State<HomePage> {
           final data = doc.data();
           final isLost = data?['isLost'] == true;
 
+          await _ensureTrackingActiveForCode(code);
+
           if (isLost) {
-            await _ensureLostTrackingForCode(code);
-          } else if (_trackingStarted) {
-            await BackgroundTracking.stop(code);
-            _trackingStarted = false;
+            debugPrint("🚨 Lost Mode active for: $code");
           }
         });
   }
 
-  Future<void> _ensureLostTrackingForCode(String code) async {
-    if (_trackingStarted || _trackingStartInProgress) return;
+  Future<void> _ensureTrackingActiveForCode(String code) async {
+    if (_trackingStartInProgress) return;
 
     _trackingStartInProgress = true;
 
     try {
-      debugPrint("Ensuring lost-device tracking for: $code");
+      debugPrint("Ensuring active device protection for: $code");
 
-      final granted = await PermissionService.setupTrackingPermissions();
-      if (!granted) {
-        debugPrint("Tracking permission not granted");
-        return;
+      if (!kIsWeb) {
+        final granted = await PermissionService.setupTrackingPermissions();
+        if (granted) {
+          final started = await BackgroundTracking.start(code);
+          if (started) {
+            _trackingStarted = true;
+          }
+        }
       }
 
-      final started = await BackgroundTracking.start(code);
-      if (started) {
-        debugPrint("Tracking started successfully");
-        _trackingStarted = true;
-      } else {
-        debugPrint("Tracking start failed");
-      }
+      // Also ensure Flutter LocationService is tracking & updating location
+      LocationService().startTracking(deviceId ?? code);
     } finally {
       _trackingStartInProgress = false;
     }
@@ -259,58 +265,80 @@ class _HomePageState extends State<HomePage> {
   // ================= CREATE CODE =================
 
   Future<void> _chooseCode() async {
-    if (deviceId == null) {
-      _showMsg("Device not initialized");
-      return;
+    if (_creatingCode) return;
+
+    debugPrint("Create Your Code button pressed");
+
+    if (mounted) {
+      setState(() => _creatingCode = true);
     }
 
-    final controller = TextEditingController();
-    final result = await showDialog<String>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text("Create Your Code"),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(hintText: "Enter 6-8 chars code"),
-          textCapitalization: TextCapitalization.characters,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, "SYSTEM"),
-            child: const Text("System Generate"),
-          ),
-          ElevatedButton(
-            onPressed: () =>
-                Navigator.pop(context, controller.text.trim().toUpperCase()),
-            child: const Text("Create"),
-          ),
-        ],
-      ),
-    );
-
-    if (result == null) return;
-
-    String? code;
-    if (result == "SYSTEM") {
-      code = await CodeService.generateSystemCode(deviceId!);
-    } else {
-      if (result.length < 6) {
-        _showMsg("Code must be at least 6 characters");
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        debugPrint("Create Code Failed: no authenticated user");
+        _showMsg("Create code failed: User is not authenticated.");
         return;
       }
-      code = await CodeService.createCustomCode(result, deviceId!);
+
+      final uid = user.uid;
+      debugPrint("Current UID: $uid");
+
+      if (deviceId == null || deviceId!.isEmpty) {
+        debugPrint(
+          "Device ID missing; registering device before code creation",
+        );
+        deviceId = await DeviceService.registerDevice().timeout(
+          const Duration(seconds: 4),
+          onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
+        );
+        debugPrint("Device ID resolved: $deviceId");
+      }
+
+      final res = await CodeService.generateSystemCode(deviceId!);
+
+      if (!res.success) {
+        debugPrint("Create Code Failed: ${res.message}");
+        _showMsg(res.message);
+        return;
+      }
+
+      final code = res.code?.trim().toUpperCase();
+      if (code == null || code.isEmpty) {
+        throw StateError(
+          "Code service returned success without a device code.",
+        );
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      final savedUnique = await prefs.setString('uniqueCode', code);
+      final savedUid = await prefs.setString('cached_code_$uid', code);
+      debugPrint(
+        "SharedPreferences Saved: uniqueCode=$savedUnique cached_code_$uid=$savedUid",
+      );
+
+      if (!savedUnique || !savedUid) {
+        throw StateError("SharedPreferences returned false while saving code.");
+      }
+
+      if (mounted) {
+        setState(() {
+          uniqueCode = code;
+        });
+        debugPrint("UI Refreshed: uniqueCode=$code");
+      }
+
+      _listenToActiveDeviceCode(code);
+      _showMsg(res.message);
+    } catch (e, stackTrace) {
+      debugPrint("Create Code Exception: $e");
+      debugPrint("Stack Trace: $stackTrace");
+      _showMsg("Create code failed: $e");
+    } finally {
+      if (mounted) {
+        setState(() => _creatingCode = false);
+      }
     }
-
-    if (code == null) {
-      _showMsg("Code already taken. Try another.");
-      return;
-    }
-
-    debugPrint("✅ Code created: $code");
-
-    if (mounted) setState(() => uniqueCode = code);
-    _listenToActiveDeviceCode(code);
-    _showMsg("Code created successfully");
   }
 
   Future<void> _checkSecuritySetup() async {
@@ -609,7 +637,7 @@ class _HomePageState extends State<HomePage> {
                                       borderRadius: BorderRadius.circular(10),
                                     ),
                                   ),
-                                  onPressed: _chooseCode,
+                                  onPressed: _creatingCode ? null : _chooseCode,
                                   child: const Text("Create Your Code"),
                                 ),
                               ),

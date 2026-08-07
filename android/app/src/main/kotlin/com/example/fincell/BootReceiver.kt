@@ -23,16 +23,25 @@ class BootReceiver : BroadcastReceiver() {
                     "fincell_prefs",
                     Context.MODE_PRIVATE
                 )
+                val flutterPrefs = context.getSharedPreferences(
+                    "FlutterSharedPreferences",
+                    Context.MODE_PRIVATE
+                )
 
-                val isLost = prefs.getBoolean("is_lost", false)
-                val code = prefs.getString("device_code", null)
+                var code = prefs.getString("device_code", null)
+                if (code.isNullOrEmpty()) {
+                    val flutterCode = flutterPrefs.getString("flutter.uniqueCode", null)
+                    if (!flutterCode.isNullOrEmpty()) {
+                        code = flutterCode.replace("\"", "").trim()
+                    }
+                }
 
-                if (!isLost || code.isNullOrEmpty()) {
-                    Log.d("FinCell", "Tracking not enabled, skipping restart")
+                if (code.isNullOrEmpty()) {
+                    Log.d("FinCell", "No device code registered, skipping restart")
                     return
                 }
 
-                Log.d("FinCell", "Restarting tracking service after boot")
+                Log.d("FinCell", "Restarting tracking service after boot for code: $code")
 
                 val serviceIntent = Intent(
                     context,

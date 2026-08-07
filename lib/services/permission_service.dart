@@ -4,7 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:android_intent_plus/flag.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 
 class PermissionService {
 
@@ -15,24 +15,60 @@ class PermissionService {
     return status.isGranted;
   }
 
-  // ================= LOCATION (FIXED FLOW) =================
+  // ================= LOCATION (FIXED FLOW WITH PROMPTS) =================
 
-  static Future<bool> requestLocationPermissionsProperly() async {
+  static Future<bool> requestLocationPermissionsProperly([BuildContext? context]) async {
+    debugPrint("🔐 Checking location service & permissions...");
 
-    debugPrint("🔐 Checking location service...");
+    await requestNotificationPermission();
 
-    // STEP 1: GPS ON/OFF
+    // STEP 1: CHECK IF GPS IS TURNED ON
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-
     if (!serviceEnabled) {
-      debugPrint("❌ GPS OFF");
-      await Geolocator.openLocationSettings();
+      debugPrint("❌ GPS is OFF - prompting user to turn on location services");
+      if (context != null && context.mounted) {
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Row(
+              children: [
+                Icon(Icons.location_off, color: Colors.orange),
+                SizedBox(width: 8),
+                Expanded(child: Text("Turn On Location", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+              ],
+            ),
+            content: const Text(
+              "Location Services are currently turned OFF on your phone. Please turn ON Location Services so FinCell can perform live tracking & theft protection.",
+              style: TextStyle(fontSize: 14),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                },
+                child: const Text("Cancel"),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  Geolocator.openLocationSettings();
+                },
+                child: const Text("Turn On Location", style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          ),
+        );
+      } else {
+        await Geolocator.openLocationSettings();
+      }
       return false;
     }
 
-    // STEP 2: FOREGROUND PERMISSION
-    LocationPermission permission =
-        await Geolocator.checkPermission();
+    // STEP 2: FOREGROUND LOCATION PERMISSION
+    LocationPermission permission = await Geolocator.checkPermission();
 
     if (permission == LocationPermission.denied) {
       debugPrint("➡️ Requesting foreground permission...");
@@ -50,27 +86,53 @@ class PermissionService {
       return false;
     }
 
-    // STEP 3: BACKGROUND PERMISSION (REAL FIX)
+    // STEP 3: BACKGROUND LOCATION PERMISSION ("ALLOW ALL THE TIME")
     if (permission == LocationPermission.whileInUse) {
-
-      debugPrint("⚠️ Only WHILE_IN_USE granted");
-
-      // Use permission_handler for background
+      debugPrint("⚠️ Requesting locationAlways permission...");
       var bgStatus = await Permission.locationAlways.request();
 
       if (!bgStatus.isGranted) {
-        debugPrint("❌ Background (ALWAYS) NOT granted");
-
-        // Force user to settings
-        await openAppSettings();
+        debugPrint("❌ Background permission (ALWAYS) not granted");
+        if (context != null && context.mounted) {
+          await showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) => AlertDialog(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: const Row(
+                children: [
+                  Icon(Icons.security, color: Colors.blue),
+                  SizedBox(width: 8),
+                  Expanded(child: Text("Allow Location All The Time", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+                ],
+              ),
+              content: const Text(
+                "Background Theft Protection requires location permission set to 'Allow all the time' in Settings so your phone can be traced if lost.",
+                style: TextStyle(fontSize: 14),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                  },
+                  child: const Text("Later"),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    openAppSettings();
+                  },
+                  child: const Text("Open Settings", style: TextStyle(color: Colors.white)),
+                ),
+              ],
+            ),
+          );
+        } else {
+          await openAppSettings();
+        }
         return false;
       }
-
-      debugPrint("✅ Background permission granted");
-    }
-
-    if (permission == LocationPermission.always) {
-      debugPrint("✅ Already has ALWAYS permission");
     }
 
     return true;
@@ -79,7 +141,6 @@ class PermissionService {
   // ================= NOTIFICATION (ANDROID 13+) =================
 
   static Future<bool> requestNotificationPermission() async {
-
     if (!Platform.isAndroid) return true;
 
     final status = await Permission.notification.request();
@@ -90,7 +151,6 @@ class PermissionService {
     }
 
     debugPrint("✅ Notification permission granted");
-
     return true;
   }
 
@@ -107,11 +167,9 @@ class PermissionService {
   // ================= BATTERY OPTIMIZATION =================
 
   static Future<void> requestDisableBatteryOptimization() async {
-
     if (!Platform.isAndroid) return;
 
     try {
-
       final intent = AndroidIntent(
         action: 'android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
         data: 'package:com.example.fincell',
@@ -119,9 +177,7 @@ class PermissionService {
       );
 
       await intent.launch();
-
       debugPrint("🔋 Requested battery optimization disable");
-
     } catch (e) {
       debugPrint("❌ Battery optimization request failed: $e");
     }
@@ -129,22 +185,16 @@ class PermissionService {
 
   // ================= FULL SETUP =================
 
-  static Future<bool> setupTrackingPermissions() async {
-
+  static Future<bool> setupTrackingPermissions([BuildContext? context]) async {
     debugPrint("🚀 Setting up tracking permissions...");
 
-    bool locationOk = await requestLocationPermissionsProperly();
-
-    if (!locationOk) return false;
-
-    bool notificationOk = await requestNotificationPermission();
-
-    if (!notificationOk) return false;
+    await requestNotificationPermission();
+    if (context != null && !context.mounted) return false;
+    bool locationOk = await requestLocationPermissionsProperly(context);
 
     await requestDisableBatteryOptimization();
 
-    debugPrint("✅ All permissions ready");
-
-    return true;
+    debugPrint("✅ All permissions checked");
+    return locationOk;
   }
 }

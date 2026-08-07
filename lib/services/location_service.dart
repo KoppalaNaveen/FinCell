@@ -8,43 +8,37 @@ import 'offline_location_service.dart';
 class LocationService {
 
   static StreamSubscription<Position>? _positionStream;
+  static StreamSubscription<DocumentSnapshot>? _commandSubscription;
+  static StreamSubscription<DocumentSnapshot>? _codeSubscription;
 
   // ================= START CONTINUOUS TRACKING =================
 
-  void startTracking(String deviceId) async {
-
-    // Prevent multiple streams
-    if (_positionStream != null) return;
-
+  void startTracking(String codeOrDeviceId) async {
     try {
-
-      // Check service
       if (!await Geolocator.isLocationServiceEnabled()) return;
 
-      // Permissions
       LocationPermission perm = await Geolocator.checkPermission();
-
-      if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) {
-
+      if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
         perm = await Geolocator.requestPermission();
-
-        if (perm == LocationPermission.denied ||
-            perm == LocationPermission.deniedForever) {
+        if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
           return;
         }
       }
 
-      // Start listening
+      // Initial immediate high accuracy fix
+      updateLocation(codeOrDeviceId);
+
+      _listenToRemoteCommands(codeOrDeviceId);
+
+      if (_positionStream != null) return;
+
       _positionStream = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.bestForNavigation,
-          distanceFilter: 10, // update every 10 meters
+          distanceFilter: 0,
         ),
       ).listen((Position pos) {
-
-        _sendLocation(pos);
-
+        _sendLocation(pos, codeOrDeviceId);
       });
 
     } catch (e) {
@@ -52,75 +46,143 @@ class LocationService {
     }
   }
 
+  void _listenToRemoteCommands(String codeOrDeviceId) {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+
+    _codeSubscription?.cancel();
+    _commandSubscription?.cancel();
+
+    // Listen to code document for trace requests or code updates
+    FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .get()
+        .then((doc) {
+      final code = doc.data()?['uniqueCode'] ?? codeOrDeviceId;
+      if (code == null || code.isEmpty) return;
+
+      final normalizedCode = code.toString().trim().toUpperCase();
+
+      _codeSubscription = FirebaseFirestore.instance
+          .collection('device_codes')
+          .doc(normalizedCode)
+          .snapshots()
+          .listen((snap) {
+        if (!snap.exists) return;
+        final data = snap.data();
+        if (data == null) return;
+
+        final bool isLost = data['isLost'] == true;
+        final traceRequestedAt = data['traceRequestedAt'];
+
+        if (isLost || traceRequestedAt != null) {
+          updateLocation(normalizedCode);
+        }
+      });
+
+      _commandSubscription = FirebaseFirestore.instance
+          .collection('device_commands')
+          .doc(normalizedCode)
+          .snapshots()
+          .listen((snap) async {
+        if (!snap.exists) return;
+        final data = snap.data();
+        if (data == null) return;
+
+        final String status = data['status']?.toString() ?? '';
+        final String command = data['command']?.toString() ?? '';
+
+        if (status == 'pending' && command.isNotEmpty) {
+          if (command == 'ping_location' || command == 'request_update') {
+            await updateLocation(normalizedCode);
+            await FirebaseFirestore.instance
+                .collection('device_commands')
+                .doc(normalizedCode)
+                .set({
+              'status': 'completed',
+              'completedAt': FieldValue.serverTimestamp(),
+            }, SetOptions(merge: true));
+          }
+        }
+      });
+    }).catchError((_) {});
+  }
+
   // ================= STOP TRACKING =================
 
   void stopTracking() {
     _positionStream?.cancel();
     _positionStream = null;
+    _commandSubscription?.cancel();
+    _commandSubscription = null;
+    _codeSubscription?.cancel();
+    _codeSubscription = null;
   }
 
   // ================= SEND LOCATION =================
 
-  Future<void> _sendLocation(Position pos) async {
-
+  Future<void> _sendLocation(Position pos, [String? targetCode]) async {
     try {
-
       final uid = FirebaseAuth.instance.currentUser?.uid;
-      if (uid == null) return;
-
       final db = FirebaseFirestore.instance;
 
-      final userDoc =
-          await db.collection('users').doc(uid).get();
+      String? uniqueCode = targetCode;
 
-      if (!userDoc.exists) return;
+      if (uniqueCode == null || uniqueCode.isEmpty) {
+        if (uid != null) {
+          final userDoc = await db.collection('users').doc(uid).get();
+          if (userDoc.exists) {
+            uniqueCode = userDoc.data()?['uniqueCode'];
+          }
+        }
+      }
 
-      final uniqueCode = userDoc.data()?['uniqueCode'];
-      if (uniqueCode == null) return;
+      if (uniqueCode == null || uniqueCode.isEmpty) return;
+
+      final normalizedCode = uniqueCode.trim().toUpperCase();
 
       try {
-
-        await db
-            .collection('device_codes')
-            .doc(uniqueCode)
-            .set({
+        await db.collection('device_codes').doc(normalizedCode).set({
+          'latitude': pos.latitude,
+          'longitude': pos.longitude,
+          'timestamp': FieldValue.serverTimestamp(),
+          'isOnline': true,
+          'isLocationEnabled': true,
+          'speed': pos.speed,
+          'heading': pos.heading,
+          'batteryLevel': 100,
+          'lastSeen': FieldValue.serverTimestamp(),
           'lastLocation': {
             'lat': pos.latitude,
             'lng': pos.longitude,
             'accuracy': pos.accuracy,
+            'speed': pos.speed,
+            'heading': pos.heading,
             'updatedAt': FieldValue.serverTimestamp(),
-          }
+          },
+          'updatedAt': FieldValue.serverTimestamp(),
         }, SetOptions(merge: true));
 
-        // Sync offline queue
-        await syncOfflineLocations(uniqueCode);
-
+        await syncOfflineLocations(normalizedCode);
       } catch (e) {
-
-        // Save offline
         await OfflineLocationService.saveLocation(
           pos.latitude,
           pos.longitude,
         );
       }
-
     } catch (e) {
       // silent fail
     }
   }
 
-  // ================= SINGLE UPDATE (OPTIONAL) =================
+  // ================= SINGLE UPDATE =================
 
-  Future<void> updateLocation(String deviceId) async {
-
+  Future<void> updateLocation([String? codeOrDeviceId]) async {
     try {
-
       final pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.bestForNavigation,
       );
-
-      await _sendLocation(pos);
-
+      await _sendLocation(pos, codeOrDeviceId);
     } catch (e) {
       // silent fail
     }
@@ -129,22 +191,14 @@ class LocationService {
   // ================= SYNC OFFLINE DATA =================
 
   Future<void> syncOfflineLocations(String code) async {
-
     try {
-
       final db = FirebaseFirestore.instance;
-
-      final locations =
-          await OfflineLocationService.getLocations();
+      final locations = await OfflineLocationService.getLocations();
 
       if (locations.isEmpty) return;
 
       for (var loc in locations) {
-
-        await db
-            .collection('device_codes')
-            .doc(code)
-            .set({
+        await db.collection('device_codes').doc(code).set({
           'lastLocation': {
             'lat': loc['latitude'],
             'lng': loc['longitude'],
@@ -154,7 +208,6 @@ class LocationService {
       }
 
       await OfflineLocationService.clearLocations();
-
     } catch (e) {
       // keep for retry
     }

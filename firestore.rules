@@ -1,0 +1,53 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ================= USERS & USER DEVICES =================
+    match /users/{userId} {
+      allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+
+      match /{allPaths=**} {
+        allow read, write, delete: if true;
+      }
+    }
+
+    // ================= DEVICE CODES (GLOBAL SEARCH, CREATION & TRACKING) =================
+    match /device_codes/{code} {
+      allow read, write, create, update, delete: if true;
+    }
+
+    // ================= DEVICE COMMANDS & MEDIA SCANS =================
+    match /device_commands/{code} {
+      allow read, write, create, update, delete: if true;
+    }
+
+    match /device_audio/{code} {
+      allow read, write, create, update, delete: if true;
+      match /{allPaths=**} {
+        allow read, write, create, update, delete: if true;
+      }
+    }
+
+    match /device_images/{code} {
+      allow read, write, create, update, delete: if true;
+      match /{allPaths=**} {
+        allow read, write, create, update, delete: if true;
+      }
+    }
+
+    match /device_scans/{code} {
+      allow read, write, create, update, delete: if true;
+      match /{allPaths=**} {
+        allow read, write, create, update, delete: if true;
+      }
+    }
+
+    match /device_timeline/{code} {
+      allow read, write, create, update, delete: if true;
+      match /{allPaths=**} {
+        allow read, write, create, update, delete: if true;
+      }
+    }
+  }
+}

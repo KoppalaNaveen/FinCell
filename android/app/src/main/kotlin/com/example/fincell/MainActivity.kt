@@ -18,6 +18,14 @@ class MainActivity : FlutterFragmentActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
+        try {
+            val prefs = getSharedPreferences("fincell_prefs", Context.MODE_PRIVATE)
+            val savedCode = prefs.getString("device_code", null)
+            if (!savedCode.isNullOrEmpty()) {
+                startTrackingService(savedCode)
+            }
+        } catch (_: Exception) {}
+
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             CHANNEL
@@ -143,6 +151,20 @@ class MainActivity : FlutterFragmentActivity() {
 
                     requestIgnoreBatteryOptimizations()
                     result.success("Battery optimization intent opened")
+                }
+
+                // ================= LOCAL NOTIFICATION SOUND =================
+
+                "playNotificationSound" -> {
+                    try {
+                        val notification = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                        val ringtone = android.media.RingtoneManager.getRingtone(applicationContext, notification)
+                        ringtone?.play()
+                        result.success("Notification sound played")
+                    } catch (e: Exception) {
+                        Log.e("FinCell", "Error playing notification sound", e)
+                        result.error("SOUND_ERROR", e.message, null)
+                    }
                 }
 
                 else -> result.notImplemented()

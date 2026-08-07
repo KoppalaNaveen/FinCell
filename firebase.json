@@ -1,1 +1,42 @@
-{"hosting":{"public":"build/web","ignore":["firebase.json","**/.*","**/node_modules/**"],"rewrites":[{"source":"**","destination":"/index.html"}]},"flutter":{"platforms":{"android":{"default":{"projectId":"fincell-b9995","appId":"1:1045725821597:android:2c020c7022bbef7eee7274","fileOutput":"android/app/google-services.json"}},"dart":{"lib/firebase_options.dart":{"projectId":"fincell-b9995","configurations":{"android":"1:1045725821597:android:2c020c7022bbef7eee7274","ios":"1:1045725821597:ios:e0c605789f37067aee7274","macos":"1:1045725821597:ios:e0c605789f37067aee7274","web":"1:1045725821597:web:495bdd1e7efae6b8ee7274","windows":"1:1045725821597:web:d90531226a182a4dee7274"}}}}}}
+{
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "fincell-b9995",
+          "appId": "1:1045725821597:android:2c020c7022bbef7eee7274",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "fincell-b9995",
+          "configurations": {
+            "android": "1:1045725821597:android:2c020c7022bbef7eee7274",
+            "ios": "1:1045725821597:ios:e0c605789f37067aee7274",
+            "macos": "1:1045725821597:ios:e0c605789f37067aee7274",
+            "web": "1:1045725821597:web:495bdd1e7efae6b8ee7274",
+            "windows": "1:1045725821597:web:d90531226a182a4dee7274"
+          }
+        }
+      }
+    }
+  }
+}

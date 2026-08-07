@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 import 'auth/auth_gate.dart';
+import 'auth/login_page.dart';
 import 'services/permission_service.dart';
 // 🔥 ADD THIS IMPORT AT TOP
 import 'services/background_service.dart';
@@ -12,8 +14,10 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // 🔥 DO NOT wrap this in try-catch
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  FirebaseFirestore.instance.settings = const Settings(
+    persistenceEnabled: true,
   );
 
   BackgroundTracking.initializeNativeListener();
@@ -29,7 +33,6 @@ class FinCellApp extends StatefulWidget {
 }
 
 class _FinCellAppState extends State<FinCellApp> {
-
   ThemeMode _themeMode = ThemeMode.system;
 
   @override
@@ -53,7 +56,6 @@ class _FinCellAppState extends State<FinCellApp> {
         await PermissionService.requestDisableBatteryOptimization();
         await prefs.setBool('isFirstRun', false);
       }
-
     } catch (e) {
       debugPrint("Initial setup error: $e");
     }
@@ -75,7 +77,6 @@ class _FinCellAppState extends State<FinCellApp> {
       }
 
       if (mounted) setState(() {});
-
     } catch (e) {
       debugPrint("Theme load error: $e");
     }
@@ -103,7 +104,6 @@ class _FinCellAppState extends State<FinCellApp> {
           _themeMode = mode;
         });
       }
-
     } catch (e) {
       debugPrint("Theme change error: $e");
     }
@@ -131,9 +131,12 @@ class _FinCellAppState extends State<FinCellApp> {
         scaffoldBackgroundColor: const Color(0xFF121212),
       ),
 
-      home: AuthGate(
-        onThemeChanged: _changeTheme,
-      ),
+      home: AuthGate(onThemeChanged: _changeTheme),
+
+      routes: {
+        '/login': (_) => const LoginPage(),
+        '/auth': (_) => AuthGate(onThemeChanged: _changeTheme),
+      },
     );
   }
 }

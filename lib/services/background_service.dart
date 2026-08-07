@@ -122,6 +122,20 @@ class BackgroundTracking {
     }
   }
 
+  static Future<bool> stopLocalService() async {
+    if (kIsWeb) return false;
+
+    try {
+      final result = await _channel.invokeMethod('stopService');
+      _resetCache();
+      debugPrint("Native foreground service stopped");
+      return result != null;
+    } catch (e) {
+      debugPrint("Stop local service error: $e");
+      return false;
+    }
+  }
+
   // ================= STATUS UPDATE =================
   static Future<void> _updateTrackingStatus(String code, bool isActive) async {
     try {
@@ -129,8 +143,9 @@ class BackgroundTracking {
           .collection('device_codes')
           .doc(code.toUpperCase())
           .set({
-            'isLost': isActive,
-            'lastUpdated': FieldValue.serverTimestamp(),
+            'isOnline': isActive,
+            'lastSeen': FieldValue.serverTimestamp(),
+            'updatedAt': FieldValue.serverTimestamp(),
           }, SetOptions(merge: true));
     } catch (e) {
       debugPrint("Status update error: $e");
@@ -157,67 +172,28 @@ class BackgroundTracking {
       }
 
       // Keep slightly weak indoor fixes instead of freezing the map forever.
-      if (accuracy != null && accuracy > 100) {
+      if (accuracy != null && accuracy > 250) {
         debugPrint("Unusable low-accuracy fix ignored: $accuracy");
         return;
       }
 
       final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - _lastWriteTime < 3000) return;
+      if (now - _lastWriteTime < 1500) return;
       _lastWriteTime = now;
 
       final codeRef = FirebaseFirestore.instance
           .collection('device_codes')
           .doc(normalizedCode);
 
-      if (_cachedOwnerUid == null ||
-          _cachedDeviceId == null ||
-          now - _lastCacheTime > 60000) {
-        final doc = await codeRef.get();
-
-        if (!doc.exists) {
-          debugPrint("Code not found");
-          return;
-        }
-
-        final data = doc.data();
-        if (data == null) return;
-
-        _cachedOwnerUid = data['ownerUid'];
-        _cachedDeviceId = data['deviceId'];
-        _cachedCode = normalizedCode;
-        _lastCacheTime = now;
-
-        debugPrint("Tracking mapping cached");
-      }
-
-      if (_cachedOwnerUid == null || _cachedDeviceId == null) {
-        debugPrint("Mapping missing, skipping write");
-        return;
-      }
-
-      final ownerUid = _cachedOwnerUid!;
-      final deviceId = _cachedDeviceId!;
-
-      try {
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(ownerUid)
-            .collection('devices')
-            .doc(deviceId)
-            .collection('locations')
-            .add({
-              'lat': lat,
-              'lng': lng,
-              'accuracy': accuracy,
-              'battery': battery ?? 0,
-              'timestamp': FieldValue.serverTimestamp(),
-            });
-      } catch (e) {
-        debugPrint("History write failed: $e");
-      }
-
+      // Always update device_codes doc immediately
       await codeRef.set({
+        'latitude': lat,
+        'longitude': lng,
+        'timestamp': FieldValue.serverTimestamp(),
+        'isOnline': true,
+        'isLocationEnabled': true,
+        'batteryLevel': battery ?? 0,
+        'lastSeen': FieldValue.serverTimestamp(),
         'lastLocation': {
           'lat': lat,
           'lng': lng,
@@ -228,9 +204,90 @@ class BackgroundTracking {
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
 
+      if (_cachedOwnerUid == null ||
+          _cachedDeviceId == null ||
+          now - _lastCacheTime > 60000) {
+        try {
+          final doc = await codeRef.get();
+          if (doc.exists) {
+            final data = doc.data();
+            if (data != null) {
+              _cachedOwnerUid = data['ownerUid'];
+              _cachedDeviceId = data['deviceId'];
+              _cachedCode = normalizedCode;
+              _lastCacheTime = now;
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (_cachedOwnerUid != null && _cachedDeviceId != null) {
+        final ownerUid = _cachedOwnerUid!;
+        final deviceId = _cachedDeviceId!;
+
+        try {
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(ownerUid)
+              .collection('devices')
+              .doc(deviceId)
+              .collection('locations')
+              .add({
+                'lat': lat,
+                'lng': lng,
+                'accuracy': accuracy,
+                'battery': battery ?? 0,
+                'timestamp': FieldValue.serverTimestamp(),
+              });
+        } catch (e) {
+          debugPrint("History write failed: $e");
+        }
+      }
+
       debugPrint("Firestore location updated");
     } catch (e) {
       debugPrint("Firestore write failed: $e");
+    }
+  }
+
+  // ================= REMOTE COMMANDS =================
+  static Future<void> sendPlaySoundCommand(String code, bool play) async {
+    final normalizedCode = code.trim().toUpperCase();
+    if (normalizedCode.isEmpty) return;
+
+    try {
+      final payload = {
+        'playSound': play,
+        'stopSound': !play,
+        'command': play ? 'alarm' : 'stop_alarm',
+        'status': play ? 'pending' : 'stopped',
+        'timestamp': FieldValue.serverTimestamp(),
+      };
+
+      await FirebaseFirestore.instance
+          .collection('device_commands')
+          .doc(normalizedCode)
+          .set(payload, SetOptions(merge: true));
+
+      await FirebaseFirestore.instance
+          .collection('device_codes')
+          .doc(normalizedCode)
+          .set({'playSound': play}, SetOptions(merge: true));
+
+      debugPrint(
+        "🔥 Device command sent: playSound=$play for code=$normalizedCode",
+      );
+    } catch (e) {
+      debugPrint("🔥 Command send error: $e");
+    }
+  }
+
+  static Future<void> playLocalNotificationSound() async {
+    if (kIsWeb) return;
+    try {
+      await _channel.invokeMethod('playNotificationSound');
+    } catch (e) {
+      debugPrint("Local notification sound error: $e");
     }
   }
 
