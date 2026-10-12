@@ -15,6 +15,8 @@ class DeviceService {
   }
 
   // 🔥 Get or create stable deviceId
+  static Future<String> getStableDeviceId() => _getStableDeviceId();
+
   static Future<String> _getStableDeviceId() async {
     final prefs = await SharedPreferences.getInstance();
 

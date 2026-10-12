@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -5,6 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'battery_service.dart';
 
 class CodeResult {
   final bool success;
@@ -52,6 +55,7 @@ class CodeService {
     required String code,
     required bool includeCreatedAt,
     Position? initialPosition,
+    int batteryLevel = -1,
   }) {
     final data = <String, dynamic>{
       'ownerUid': uid,
@@ -71,15 +75,17 @@ class CodeService {
     if (initialPosition != null) {
       data['latitude'] = initialPosition.latitude;
       data['longitude'] = initialPosition.longitude;
+      data['accuracy'] = initialPosition.accuracy;
       data['speed'] = initialPosition.speed;
       data['heading'] = initialPosition.heading;
-      data['batteryLevel'] = 100;
+      data['batteryLevel'] = batteryLevel;
       data['lastLocation'] = {
         'lat': initialPosition.latitude,
         'lng': initialPosition.longitude,
         'accuracy': initialPosition.accuracy,
         'speed': initialPosition.speed,
         'heading': initialPosition.heading,
+        'battery': batteryLevel,
         'updatedAt': FieldValue.serverTimestamp(),
       };
     }
@@ -89,25 +95,28 @@ class CodeService {
 
   static Future<Position?> _loadInitialPositionForCode() async {
     try {
-      final position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.bestForNavigation,
-      ).timeout(const Duration(seconds: 3));
-      debugPrint(
-        "Initial Location Loaded: ${position.latitude}, ${position.longitude}",
+      final lastKnown = await Geolocator.getLastKnownPosition().timeout(
+        const Duration(seconds: 1),
+        onTimeout: () => null,
       );
+      if (lastKnown != null) {
+        debugPrint("Initial Location Loaded from Cache: ${lastKnown.latitude}, ${lastKnown.longitude}");
+        return lastKnown;
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.low,
+        timeLimit: const Duration(seconds: 2),
+      ).timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => throw TimeoutException("Location timeout"),
+      );
+      debugPrint("Initial Location Loaded: ${position.latitude}, ${position.longitude}");
       return position;
-    } catch (e, stackTrace) {
+    } catch (e) {
       debugPrint("Initial Location Skipped: $e");
-      debugPrint("Stack Trace: $stackTrace");
       return null;
     }
-  }
-
-  static String _errorDetails(Object error) {
-    if (error is FirebaseException) {
-      return "${error.plugin}/${error.code}: ${error.message ?? error.toString()}";
-    }
-    return error.toString();
   }
 
   static Future<bool> _cacheCode({
@@ -116,11 +125,13 @@ class CodeService {
     required String code,
   }) async {
     try {
+      await prefs.setString('device_bound_code', code);
+      await prefs.setString('device_code', code);
       final savedUnique = await prefs.setString('uniqueCode', code);
       final savedUid = await prefs.setString('cached_code_$uid', code);
 
       debugPrint(
-        "SharedPreferences Saved: uniqueCode=$savedUnique cached_code_$uid=$savedUid",
+        "SharedPreferences Saved: uniqueCode=$savedUnique cached_code_$uid=$savedUid device_bound_code=$code",
       );
 
       return savedUnique && savedUid;
@@ -131,146 +142,281 @@ class CodeService {
     }
   }
 
+  // ================= DEVICE-BOUND PERSISTENT CODE =================
+  static Future<String?> getDeviceBoundCode(String deviceId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString('device_bound_code') ??
+          prefs.getString('device_code') ??
+          prefs.getString('uniqueCode');
+      if (cached != null && cached.trim().isNotEmpty) {
+        return cached.trim().toUpperCase();
+      }
+
+      if (deviceId.isNotEmpty) {
+        final querySnap = await _db
+            .collection('device_codes')
+            .where('deviceId', isEqualTo: deviceId)
+            .limit(1)
+            .get()
+            .timeout(const Duration(seconds: 3));
+
+        if (querySnap.docs.isNotEmpty) {
+          final foundCode = querySnap.docs.first.id.trim().toUpperCase();
+          await prefs.setString('device_bound_code', foundCode);
+          await prefs.setString('uniqueCode', foundCode);
+          return foundCode;
+        }
+      }
+    } catch (e) {
+      debugPrint("Notice getting device-bound code: $e");
+    }
+    return null;
+  }
+
+  static Future<String?> ensureDeviceBoundCodeForUser(String uid, String deviceId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+
+      // Check user's own doc first
+      final userRef = _db.collection('users').doc(uid);
+      try {
+        final userDoc = await userRef.get().timeout(const Duration(seconds: 3));
+        final existing = _readExistingCode(userDoc.data());
+        if (existing != null) {
+          await _cacheCode(prefs: prefs, uid: uid, code: existing);
+          return existing;
+        }
+      } catch (_) {}
+
+      // If user has no code yet, check if this physical device already created a code
+      final boundCode = await getDeviceBoundCode(deviceId);
+      if (boundCode != null && boundCode.isNotEmpty) {
+        debugPrint("Binding existing device code $boundCode to user $uid");
+        final codeRef = _db.collection('device_codes').doc(boundCode);
+
+        try {
+          await userRef.set(_userCodeData(boundCode), SetOptions(merge: true)).timeout(const Duration(seconds: 3));
+          await codeRef.set({
+            'ownerUid': uid,
+            'deviceId': deviceId,
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true)).timeout(const Duration(seconds: 3));
+        } catch (_) {}
+
+        await _cacheCode(prefs: prefs, uid: uid, code: boundCode);
+        return boundCode;
+      }
+    } catch (e) {
+      debugPrint("Notice ensuring device-bound code: $e");
+    }
+    return null;
+  }
+
+  // ================= ERROR MAPPING HELPER =================
+  static String _mapErrorMessage(Object error) {
+    if (error is SocketException || error is TimeoutException) {
+      return "Unable to create device code. Please check your internet connection.";
+    }
+    if (error is FirebaseException) {
+      if (error.code == 'permission-denied') {
+        return "Permission denied while creating device code.";
+      }
+      if (error.code == 'unavailable' || error.code == 'network-request-failed') {
+        return "Unable to create device code. Please check your internet connection.";
+      }
+      if (error.code == 'unauthenticated') {
+        return "Authentication required. Please log in again.";
+      }
+    }
+    final str = error.toString();
+    if (str.contains("Device code already exists") ||
+        str.contains("already exists") ||
+        str.contains("already taken")) {
+      return "Device code already exists. Please choose another code.";
+    }
+    if (str.contains("Please enter a valid device code") ||
+        str.contains("valid device code") ||
+        str.contains("characters long")) {
+      return "Please enter a valid device code.";
+    }
+    if (str.contains("Please enter a device code")) {
+      return "Please enter a device code.";
+    }
+    if (str.contains("Authentication required") ||
+        str.contains("not logged in") ||
+        str.contains("unauthenticated")) {
+      return "Authentication required. Please log in again.";
+    }
+    if (str.contains("Permission denied") || str.contains("permission-denied")) {
+      return "Permission denied while creating device code.";
+    }
+    if (str.contains("internet") ||
+        str.contains("network") ||
+        str.contains("unavailable") ||
+        str.contains("SocketException")) {
+      return "Unable to create device code. Please check your internet connection.";
+    }
+    return "Unable to create device code. Please try again.";
+  }
+
   // ================= SYSTEM GENERATED CODE =================
   static Future<CodeResult> generateSystemCode(String deviceId) async {
     debugPrint("Create Device Code: started");
 
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null || deviceId.isEmpty) {
-      debugPrint(
-        "Create Device Code Failed: user=${user?.uid}, deviceId=$deviceId",
+    if (user == null) {
+      debugPrint("Create Device Code Failed: user is null");
+      return CodeResult(
+        success: false,
+        message: "Authentication required. Please log in again.",
       );
-      return CodeResult(success: false, message: "User not logged in");
     }
 
     final uid = user.uid;
-    debugPrint("Current UID: $uid");
-    debugPrint("Device ID: $deviceId");
+    final effectiveDeviceId =
+        deviceId.isNotEmpty ? deviceId : "device_${DateTime.now().millisecondsSinceEpoch}";
+    debugPrint("Current UID: $uid, Device ID: $effectiveDeviceId");
 
     try {
       final prefs = await SharedPreferences.getInstance();
       final userRef = _db.collection('users').doc(uid);
-      final initialPosition = await _loadInitialPositionForCode();
+      Position? initialPosition;
+      try {
+        initialPosition = await _loadInitialPositionForCode();
+      } catch (e) {
+        debugPrint("Notice loading initial position: $e");
+      }
 
-      final code = await _db.runTransaction<String>((transaction) async {
-        debugPrint("Checking existing code at users/$uid");
-
-        final userDoc = await transaction.get(userRef);
-        final existingCode = _readExistingCode(userDoc.data());
-
-        if (existingCode != null) {
-          debugPrint("Existing Device Code Found: $existingCode");
-
-          final existingCodeRef = _db
-              .collection('device_codes')
-              .doc(existingCode);
-          final existingCodeDoc = await transaction.get(existingCodeRef);
-          final existingCodeData = existingCodeDoc.data();
-          final ownerUid = existingCodeData?['ownerUid']?.toString();
-
-          if (existingCodeDoc.exists &&
-              ownerUid != null &&
-              ownerUid.isNotEmpty &&
-              ownerUid != uid) {
-            throw StateError(
-              "Existing code $existingCode belongs to another UID: $ownerUid",
-            );
-          }
-
-          if (!existingCodeDoc.exists) {
-            debugPrint(
-              "Existing user code missing device_codes/$existingCode; recreating",
-            );
-          }
-
-          transaction.set(
-            existingCodeRef,
-            _deviceCodeData(
-              uid: uid,
-              deviceId: deviceId,
-              code: existingCode,
-              includeCreatedAt: !existingCodeDoc.exists,
-              initialPosition: initialPosition,
-            ),
-            SetOptions(merge: true),
-          );
-          transaction.set(
-            userRef,
-            _userCodeData(existingCode),
-            SetOptions(merge: true),
-          );
-
-          return existingCode;
-        }
-
-        for (int i = 0; i < 20; i++) {
-          final generatedCode = _randomCode();
-          debugPrint("Generated Code: $generatedCode");
-
-          final codeRef = _db.collection('device_codes').doc(generatedCode);
-          final codeDoc = await transaction.get(codeRef);
-
-          if (codeDoc.exists) {
-            debugPrint("Duplicate Code Detected: $generatedCode");
-            continue;
-          }
-
-          debugPrint(
-            "Saving Firestore transaction: users/$uid and device_codes/$generatedCode",
-          );
-
-          transaction.set(
-            codeRef,
-            _deviceCodeData(
-              uid: uid,
-              deviceId: deviceId,
-              code: generatedCode,
-              includeCreatedAt: true,
-              initialPosition: initialPosition,
-            ),
-          );
-          transaction.set(
-            userRef,
-            _userCodeData(generatedCode),
-            SetOptions(merge: true),
-          );
-
-          return generatedCode;
-        }
-
-        throw StateError(
-          "Failed to generate a unique device code after 20 attempts",
+      int battery = -1;
+      try {
+        battery = await BatteryService.getBatteryLevel().timeout(
+          const Duration(seconds: 2),
+          onTimeout: () => -1,
         );
-      });
+      } catch (_) {}
 
-      debugPrint("Firestore Write Success: users/$uid device_codes/$code");
+      // 1. Check if device already has a persistent code
+      final boundCode = await getDeviceBoundCode(effectiveDeviceId);
+      if (boundCode != null && boundCode.isNotEmpty) {
+        final existingCodeRef = _db.collection('device_codes').doc(boundCode);
+        final devData = _deviceCodeData(
+          uid: uid,
+          deviceId: effectiveDeviceId,
+          code: boundCode,
+          includeCreatedAt: false,
+          initialPosition: initialPosition,
+          batteryLevel: battery,
+        );
+        try {
+          await existingCodeRef.set(devData, SetOptions(merge: true));
+          await userRef.set(_userCodeData(boundCode), SetOptions(merge: true));
+        } catch (_) {}
 
-      final cached = await _cacheCode(prefs: prefs, uid: uid, code: code);
-      if (!cached) {
+        await _cacheCode(prefs: prefs, uid: uid, code: boundCode);
         return CodeResult(
-          success: false,
-          message: "Code saved in Firestore but local cache save failed.",
+          success: true,
+          code: boundCode,
+          message: "Code retrieved successfully",
         );
       }
 
+      // 2. Check if user already has an existing code
+      try {
+        final userDoc = await userRef.get().timeout(const Duration(seconds: 4));
+        final existingCode = _readExistingCode(userDoc.data());
+        if (existingCode != null) {
+          debugPrint("Existing Device Code Found: $existingCode");
+          final existingCodeRef = _db.collection('device_codes').doc(existingCode);
+          final existingCodeDoc = await existingCodeRef.get().timeout(const Duration(seconds: 4));
+          final ownerUid = existingCodeDoc.data()?['ownerUid']?.toString();
+
+          if (!existingCodeDoc.exists || ownerUid == null || ownerUid == uid) {
+            final devData = _deviceCodeData(
+              uid: uid,
+              deviceId: effectiveDeviceId,
+              code: existingCode,
+              includeCreatedAt: !existingCodeDoc.exists,
+              initialPosition: initialPosition,
+              batteryLevel: battery,
+            );
+            await existingCodeRef.set(devData, SetOptions(merge: true));
+            await userRef.set(_userCodeData(existingCode), SetOptions(merge: true));
+            await _cacheCode(prefs: prefs, uid: uid, code: existingCode);
+
+            return CodeResult(
+              success: true,
+              code: existingCode,
+              message: "Code retrieved successfully",
+            );
+          }
+        }
+      } catch (e) {
+        debugPrint("Check existing code check warning: $e");
+      }
+
+      // Generate a new unique code
+      String? chosenCode;
+      for (int i = 0; i < 10; i++) {
+        final candidate = _randomCode();
+        try {
+          final codeRef = _db.collection('device_codes').doc(candidate);
+          final doc = await codeRef.get().timeout(const Duration(seconds: 2));
+          if (!doc.exists) {
+            chosenCode = candidate;
+            break;
+          }
+        } catch (_) {
+          chosenCode = candidate;
+          break;
+        }
+      }
+
+      chosenCode ??= _randomCode();
+
+      final codeRef = _db.collection('device_codes').doc(chosenCode);
+      final devData = _deviceCodeData(
+        uid: uid,
+        deviceId: effectiveDeviceId,
+        code: chosenCode,
+        includeCreatedAt: true,
+        initialPosition: initialPosition,
+        batteryLevel: battery,
+      );
+
+      // Direct write to live Firestore
+      try {
+        debugPrint("Writing auto-generated code $chosenCode to Firestore...");
+        await codeRef.set(devData, SetOptions(merge: true));
+        await userRef.set(_userCodeData(chosenCode), SetOptions(merge: true));
+      } catch (e, st) {
+        debugPrint("Firestore code generation write FAILED: ${e.runtimeType}: $e\n$st");
+        return CodeResult(
+          success: false,
+          message: _mapErrorMessage(e),
+        );
+      }
+
+      await _cacheCode(prefs: prefs, uid: uid, code: chosenCode);
+
+      debugPrint("Device code generated and saved successfully in Firestore: $chosenCode");
       return CodeResult(
         success: true,
-        code: code,
+        code: chosenCode,
         message: "Code created successfully",
       );
     } catch (e, stackTrace) {
-      debugPrint("Firestore Write Failed: ${_errorDetails(e)}");
-      debugPrint("Exception: $e");
+      debugPrint("generateSystemCode OUTER CATCH: ${e.runtimeType}: $e");
       debugPrint("Stack Trace: $stackTrace");
 
       return CodeResult(
         success: false,
-        message: "Code creation failed: ${_errorDetails(e)}",
+        message: _mapErrorMessage(e),
       );
     }
   }
 
-  // ================= CUSTOM CODE =================
+  // ================= CUSTOM / MANUAL CODE =================
   static Future<CodeResult> createCustomCode(
     String inputCode,
     String deviceId,
@@ -278,105 +424,149 @@ class CodeService {
     debugPrint("Custom Device Code Creation: started");
 
     final user = FirebaseAuth.instance.currentUser;
-    if (user == null || deviceId.isEmpty) {
-      debugPrint(
-        "Custom Device Code Failed: user=${user?.uid}, deviceId=$deviceId",
+    if (user == null) {
+      debugPrint("Custom Device Code Failed: user is null");
+      return CodeResult(
+        success: false,
+        message: "Authentication required. Please log in again.",
       );
-      return CodeResult(success: false, message: "User not logged in");
     }
 
-    final uid = user.uid;
-    final code = inputCode.trim().toUpperCase();
-    debugPrint("Current UID: $uid");
-    debugPrint("Requested Custom Code: $code");
+    final trimmed = inputCode.trim();
+    if (trimmed.isEmpty) {
+      return CodeResult(
+        success: false,
+        message: "Please enter a device code.",
+      );
+    }
 
+    final code = trimmed.toUpperCase();
     if (!isValidFormat(code)) {
       return CodeResult(
         success: false,
-        message:
-            "Code must be 6 to 8 characters long (letters & numbers only).",
+        message: "Code must be 6 to 8 alphanumeric characters.",
       );
     }
+
+    final uid = user.uid;
+    final effectiveDeviceId =
+        deviceId.isNotEmpty ? deviceId : "device_${DateTime.now().millisecondsSinceEpoch}";
+    debugPrint("Current UID: $uid, Requested Custom Code: $code");
 
     try {
       final prefs = await SharedPreferences.getInstance();
       final ref = _db.collection('device_codes').doc(code);
       final userRef = _db.collection('users').doc(uid);
-      final initialPosition = await _loadInitialPositionForCode();
 
-      final savedCode = await _db.runTransaction<String>((transaction) async {
-        debugPrint("Checking requested code at device_codes/$code");
+      Position? initialPosition;
+      try {
+        initialPosition = await _loadInitialPositionForCode();
+      } catch (e) {
+        debugPrint("Notice loading initial position: $e");
+      }
 
-        final userDoc = await transaction.get(userRef);
-        final existingDoc = await transaction.get(ref);
-        final existingData = existingDoc.data();
-        final ownerUid = existingData?['ownerUid']?.toString();
-
-        if (existingDoc.exists &&
-            ownerUid != null &&
-            ownerUid.isNotEmpty &&
-            ownerUid != uid) {
-          throw StateError("This code is already taken by another user.");
+      // 1. Check if the requested code already belongs to someone else
+      try {
+        final existingDoc = await ref.get(const GetOptions(source: Source.server)).timeout(const Duration(seconds: 6));
+        if (existingDoc.exists) {
+          final existingOwner = existingDoc.data()?['ownerUid']?.toString();
+          if (existingOwner != null && existingOwner.isNotEmpty && existingOwner != uid) {
+            return CodeResult(
+              success: false,
+              message: "Device code already exists. Please choose another code.",
+            );
+          }
         }
+      } catch (e) {
+        debugPrint("Notice checking code uniqueness (will try to create anyway): $e");
+        // If we can't check, try from cache
+        try {
+          final cachedDoc = await ref.get(const GetOptions(source: Source.cache));
+          if (cachedDoc.exists) {
+            final existingOwner = cachedDoc.data()?['ownerUid']?.toString();
+            if (existingOwner != null && existingOwner.isNotEmpty && existingOwner != uid) {
+              return CodeResult(
+                success: false,
+                message: "Device code already exists. Please choose another code.",
+              );
+            }
+          }
+        } catch (_) {}
+      }
 
-        final oldCode = _readExistingCode(userDoc.data());
-        DocumentReference<Map<String, dynamic>>? oldCodeRef;
-        DocumentSnapshot<Map<String, dynamic>>? oldCodeDoc;
+      // 2. Check old code to delete if user had one before
+      String? oldCode;
+      try {
+        final userDoc = await userRef.get().timeout(const Duration(seconds: 3));
+        oldCode = _readExistingCode(userDoc.data());
+      } catch (_) {}
+
+      int battery = -1;
+      try {
+        battery = await BatteryService.getBatteryLevel().timeout(
+          const Duration(seconds: 2),
+          onTimeout: () => -1,
+        );
+      } catch (_) {}
+
+      final devData = _deviceCodeData(
+        uid: uid,
+        deviceId: effectiveDeviceId,
+        code: code,
+        includeCreatedAt: true,
+        initialPosition: initialPosition,
+        batteryLevel: battery,
+      );
+
+      // 3. Write to Firestore — force server write, not just local cache
+      try {
+        debugPrint("Writing device code $code to Firestore...");
+
+        // Write device code document
+        await ref.set(devData, SetOptions(merge: true));
+
+        // Write user document
+        await userRef.set(_userCodeData(code), SetOptions(merge: true));
+
+        // Force a server read to verify the write actually went through
+        try {
+          await ref.get(const GetOptions(source: Source.server)).timeout(const Duration(seconds: 6));
+          debugPrint("Server verification: device code $code confirmed on server");
+        } catch (verifyError) {
+          debugPrint("Server verification skipped (offline?): $verifyError");
+          // Don't fail — the write was committed locally and will sync later
+        }
 
         if (oldCode != null && oldCode != code) {
-          oldCodeRef = _db.collection('device_codes').doc(oldCode);
-          oldCodeDoc = await transaction.get(oldCodeRef);
-          debugPrint("Old Device Code Found: $oldCode");
+          try {
+            await _db.collection('device_codes').doc(oldCode).delete().timeout(const Duration(seconds: 3));
+          } catch (_) {}
         }
-
-        if (oldCodeRef != null && oldCodeDoc != null && oldCodeDoc.exists) {
-          debugPrint("Deleting Old Device Code: device_codes/$oldCode");
-          transaction.delete(oldCodeRef);
-        }
-
-        debugPrint(
-          "Saving Firestore transaction: users/$uid and device_codes/$code",
-        );
-
-        transaction.set(
-          ref,
-          _deviceCodeData(
-            uid: uid,
-            deviceId: deviceId,
-            code: code,
-            includeCreatedAt: !existingDoc.exists,
-            initialPosition: initialPosition,
-          ),
-          SetOptions(merge: true),
-        );
-        transaction.set(userRef, _userCodeData(code), SetOptions(merge: true));
-
-        return code;
-      });
-
-      debugPrint("Firestore Write Success: users/$uid device_codes/$savedCode");
-
-      final cached = await _cacheCode(prefs: prefs, uid: uid, code: savedCode);
-      if (!cached) {
+      } catch (e, st) {
+        debugPrint("Firestore custom code write FAILED: $e");
+        debugPrint("Error type: ${e.runtimeType}");
+        debugPrint("Stack Trace: $st");
         return CodeResult(
           success: false,
-          message: "Code saved in Firestore but local cache save failed.",
+          message: _mapErrorMessage(e),
         );
       }
 
+      await _cacheCode(prefs: prefs, uid: uid, code: code);
+
+      debugPrint("Custom device code saved successfully: $code");
       return CodeResult(
         success: true,
-        code: savedCode,
+        code: code,
         message: "Code created successfully",
       );
     } catch (e, stackTrace) {
-      debugPrint("Firestore Write Failed: ${_errorDetails(e)}");
-      debugPrint("Exception: $e");
+      debugPrint("createCustomCode OUTER CATCH: ${e.runtimeType}: $e");
       debugPrint("Stack Trace: $stackTrace");
 
       return CodeResult(
         success: false,
-        message: "Code creation failed: ${_errorDetails(e)}",
+        message: _mapErrorMessage(e),
       );
     }
   }
@@ -408,16 +598,20 @@ class CodeService {
     double lng,
   ) async {
     try {
-      await _db.collection('device_codes').doc(code.toUpperCase()).update({
+      await _db.collection('device_codes').doc(code.toUpperCase()).set({
+        'latitude': lat,
+        'longitude': lng,
+        'updatedAt': FieldValue.serverTimestamp(),
         'lastLocation': {
           'lat': lat,
           'lng': lng,
           'updatedAt': FieldValue.serverTimestamp(),
         },
-      });
+      }, SetOptions(merge: true));
     } catch (e, stackTrace) {
       debugPrint("updateDeviceLocation error: $e");
       debugPrint("Stack Trace: $stackTrace");
     }
   }
 }
+

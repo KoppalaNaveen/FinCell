@@ -44,15 +44,23 @@ class _LiveMapPageState extends State<LiveMapPage> {
     _listenDevice();
   }
 
-  // ================= USER LOCATION =================
-
   Future<void> _getUserLocation() async {
-
-    final pos = await Geolocator.getCurrentPosition();
-
-    setState(() {
-      userLocation = LatLng(pos.latitude, pos.longitude);
-    });
+    try {
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null && mounted) {
+        setState(() {
+          userLocation = LatLng(lastKnown.latitude, lastKnown.longitude);
+        });
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 3));
+      if (mounted) {
+        setState(() {
+          userLocation = LatLng(pos.latitude, pos.longitude);
+        });
+      }
+    } catch (_) {}
   }
 
   // ================= DEVICE LISTENER =================

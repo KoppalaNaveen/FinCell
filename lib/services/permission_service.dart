@@ -4,6 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:android_intent_plus/flag.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/material.dart';
 
 class PermissionService {
@@ -17,7 +18,10 @@ class PermissionService {
 
   // ================= LOCATION (FIXED FLOW WITH PROMPTS) =================
 
-  static Future<bool> requestLocationPermissionsProperly([BuildContext? context]) async {
+  static Future<bool> requestLocationPermissionsProperly([
+    BuildContext? context,
+    bool requireBackground = false,
+  ]) async {
     debugPrint("🔐 Checking location service & permissions...");
 
     await requestNotificationPermission();
@@ -82,12 +86,20 @@ class PermissionService {
 
     if (permission == LocationPermission.deniedForever) {
       debugPrint("❌ Permanently denied → open settings");
-      await openAppSettings();
+      if (context != null && context.mounted) {
+        await openAppSettings();
+      }
       return false;
     }
 
     // STEP 3: BACKGROUND LOCATION PERMISSION ("ALLOW ALL THE TIME")
     if (permission == LocationPermission.whileInUse) {
+      if (!requireBackground) {
+        // Foreground permission is already sufficient for map & trace display
+        Permission.locationAlways.request().catchError((_) => PermissionStatus.denied);
+        return true;
+      }
+
       debugPrint("⚠️ Requesting locationAlways permission...");
       var bgStatus = await Permission.locationAlways.request();
 
@@ -128,10 +140,10 @@ class PermissionService {
               ],
             ),
           );
-        } else {
-          await openAppSettings();
+          return false;
         }
-        return false;
+        // If context is null and whileInUse is granted, allow foreground tracking to continue
+        return true;
       }
     }
 
@@ -166,21 +178,77 @@ class PermissionService {
 
   // ================= BATTERY OPTIMIZATION =================
 
-  static Future<void> requestDisableBatteryOptimization() async {
+  static Future<void> requestDisableBatteryOptimization({bool openSettingsIfDenied = false}) async {
     if (!Platform.isAndroid) return;
 
     try {
-      final intent = AndroidIntent(
-        action: 'android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
-        data: 'package:com.example.fincell',
-        flags: <int>[Flag.FLAG_ACTIVITY_NEW_TASK],
-      );
+      final status = await Permission.ignoreBatteryOptimizations.status;
+      if (status.isGranted) {
+        debugPrint("🔋 Battery optimization already disabled");
+        return;
+      }
 
-      await intent.launch();
-      debugPrint("🔋 Requested battery optimization disable");
+      if (!openSettingsIfDenied) {
+        final prefs = await SharedPreferences.getInstance();
+        final hasPrompted = prefs.getBool('battery_opt_prompted') ?? false;
+        if (hasPrompted) return;
+        await prefs.setBool('battery_opt_prompted', true);
+      }
+
+      final reqStatus = await Permission.ignoreBatteryOptimizations.request();
+      if (!reqStatus.isGranted && openSettingsIfDenied) {
+        final intent = AndroidIntent(
+          action: 'android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
+          data: 'package:com.example.fincell',
+          flags: <int>[Flag.FLAG_ACTIVITY_NEW_TASK],
+        );
+        await intent.launch();
+      }
+      debugPrint("🔋 Battery optimization handled gracefully");
     } catch (e) {
-      debugPrint("❌ Battery optimization request failed: $e");
+      debugPrint("❌ Battery optimization request notice: $e");
     }
+  }
+
+  static Future<void> showOemBatteryOptimizationDialog(BuildContext context) async {
+    if (!Platform.isAndroid || !context.mounted) return;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.battery_alert, color: Colors.orange),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                "Background Protection",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: const Text(
+          "OEM Android devices (Samsung OneUI, Xiaomi MIUI, Realme UI, ColorOS, OxygenOS, FuntouchOS) aggressively stop background tracking services to save battery.\n\nTo ensure FinCell can continuously monitor and track your device if lost, please disable Battery Optimization or allow 'Unrestricted' background activity.",
+          style: TextStyle(fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Later"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+            onPressed: () {
+              Navigator.pop(ctx);
+              requestDisableBatteryOptimization(openSettingsIfDenied: true);
+            },
+            child: const Text("Open Settings", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
   }
 
   // ================= FULL SETUP =================

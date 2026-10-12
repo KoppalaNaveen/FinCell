@@ -47,8 +47,22 @@ class _LiveTraceMapPageState extends State<LiveTraceMapPage> {
   }
 
   void _listen() async {
-    final pos = await Geolocator.getCurrentPosition();
-    myLocation = LatLng(pos.latitude, pos.longitude);
+    try {
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null && mounted) {
+        setState(() {
+          myLocation = LatLng(lastKnown.latitude, lastKnown.longitude);
+        });
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 3));
+      if (mounted) {
+        setState(() {
+          myLocation = LatLng(pos.latitude, pos.longitude);
+        });
+      }
+    } catch (_) {}
 
     sub = FirebaseFirestore.instance
         .collection('users')

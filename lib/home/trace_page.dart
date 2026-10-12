@@ -7,12 +7,19 @@ import 'package:geolocator/geolocator.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/foundation.dart';
 
-import '../services/permission_service.dart';
 import '../services/background_service.dart';
 import '../services/theft_detection_service.dart';
 import '../services/movement_prediction_service.dart';
 import '../services/environment_scanner_service.dart';
+import '../services/offline_direct_trace_service.dart';
+import '../services/offline_location_service.dart';
+import '../services/sync_manager.dart';
+import '../services/security_validator.dart';
 import 'security_timeline_page.dart';
+import '../components/offline_status_banner.dart';
+import '../components/community_detection_card.dart';
+import '../services/cached_tile_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class TracePage extends StatefulWidget {
   final String? initialCode;
@@ -29,6 +36,7 @@ class _TracePageState extends State<TracePage> {
   StreamSubscription<DocumentSnapshot>? _deviceCodeSub;
   StreamSubscription<DocumentSnapshot>? _commandSub;
   StreamSubscription<QuerySnapshot>? _locationHistorySub;
+  StreamSubscription<SyncProgress>? _syncProgressSub;
 
   bool _myLocationStreamStarting = false;
   final MapController _mapController = MapController();
@@ -38,9 +46,10 @@ class _TracePageState extends State<TracePage> {
   LatLng? animatedDevice;
   Timer? _animationTimer;
 
-  bool isLoading = true;
+  bool isLoading = false;
   double? distance; // distance in meters
   String? direction;
+  double? myAccuracy;
   double? lostAccuracy;
   int? lostBattery;
   DateTime? lostUpdatedAt;
@@ -51,6 +60,8 @@ class _TracePageState extends State<TracePage> {
   bool isLost = false;
   bool isLastKnownLocation = false;
   String deviceStateText = "Offline";
+  bool _isOfflineDirectTrace = false;
+  bool _isDirectConnected = false;
 
   // Security & Theft Engine State
   int riskScore = 0;
@@ -79,14 +90,38 @@ class _TracePageState extends State<TracePage> {
   @override
   void initState() {
     super.initState();
-    FirebaseFirestore.instance.settings = const Settings(
-      persistenceEnabled: true,
-    );
+
+    _syncProgressSub = SyncManager.instance.progressStream.listen((progress) {
+      if (progress.isOnline && _isOfflineDirectTrace) {
+        final code = _controller.text.trim().toUpperCase();
+        if (code.isNotEmpty && mounted) {
+          debugPrint("🌐 Internet restored on Trace Page. Resuming Firestore live tracking for $code...");
+          _isOfflineDirectTrace = false;
+          OfflineDirectTraceService.instance.stopPolling();
+          _listenFromDeviceCode(code);
+          _listenToCommands(code);
+        }
+      }
+    });
 
     if (widget.initialCode != null) {
       _startTracking(widget.initialCode!);
+    } else {
+      _loadSavedDeviceCode();
     }
     _initMyLocationStream();
+  }
+
+  Future<void> _loadSavedDeviceCode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedCode = prefs.getString('uniqueCode') ?? prefs.getString('device_code');
+      if (savedCode != null && savedCode.isNotEmpty && mounted && _controller.text.isEmpty) {
+        setState(() {
+          _controller.text = savedCode.toUpperCase();
+        });
+      }
+    } catch (_) {}
   }
 
   void _startTracking(String code) {
@@ -96,11 +131,13 @@ class _TracePageState extends State<TracePage> {
   }
 
   void _resetTrackingState() {
+    OfflineDirectTraceService.instance.stopPolling();
     path.clear();
     lostDevice = null;
     animatedDevice = null;
     distance = null;
     direction = null;
+    myAccuracy = null;
     lostAccuracy = null;
     lostBattery = null;
     lostUpdatedAt = null;
@@ -108,6 +145,8 @@ class _TracePageState extends State<TracePage> {
     lostHeading = null;
     isLastKnownLocation = false;
     deviceStateText = "Offline";
+    _isOfflineDirectTrace = false;
+    _isDirectConnected = false;
     isTracingActive = false;
     firstLocationReceived = false;
     _locationHistoryPoints.clear();
@@ -117,13 +156,21 @@ class _TracePageState extends State<TracePage> {
 
   @override
   void dispose() {
+    OfflineDirectTraceService.instance.stopPolling();
     _controller.dispose();
     _myLocSub?.cancel();
     _deviceCodeSub?.cancel();
     _commandSub?.cancel();
     _locationHistorySub?.cancel();
+    _syncProgressSub?.cancel();
     _animationTimer?.cancel();
     super.dispose();
+  }
+
+  void _centerMap(LatLng target, [double zoom = 16.0]) {
+    try {
+      _mapController.move(target, zoom);
+    } catch (_) {}
   }
 
   // ================= 1. LIVE LOCATION (CURRENT DEVICE) =================
@@ -133,12 +180,14 @@ class _TracePageState extends State<TracePage> {
     _myLocationStreamStarting = true;
 
     if (!kIsWeb) {
-      bool ok = await PermissionService.requestLocationPermissionsProperly();
-      if (!ok) {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
         if (mounted) {
           setState(() {
-            isLoading = false;
-            statusMessage = "Permission Denied";
+            statusMessage = "Location Permission Denied";
           });
         }
         _myLocationStreamStarting = false;
@@ -151,68 +200,144 @@ class _TracePageState extends State<TracePage> {
       if (!serviceEnabled) {
         if (mounted) {
           setState(() {
-            isLoading = false;
-            statusMessage = "Please turn ON GPS";
+            statusMessage = "Please turn ON GPS Location";
           });
         }
         _myLocationStreamStarting = false;
         return;
       }
 
+      // Step 1: Immediately read last known location from OS cache (instant, 0 network required)
       try {
-        final pos = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.bestForNavigation,
-        ).timeout(const Duration(seconds: 3));
-        if (mounted) {
+        final lastKnown = await Geolocator.getLastKnownPosition();
+        if (lastKnown != null && mounted) {
           setState(() {
-            myLocation = LatLng(pos.latitude, pos.longitude);
-            isLoading = false;
-            statusMessage = "Ready. Enter device code.";
+            myLocation = LatLng(lastKnown.latitude, lastKnown.longitude);
+            myAccuracy = lastKnown.accuracy;
+            statusMessage = "Live GPS Active";
             _recalcDistanceAndDirection();
+            if (lostDevice == null) {
+              _centerMap(myLocation!);
+            }
           });
         }
       } catch (_) {}
 
-      _myLocSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.bestForNavigation,
-          distanceFilter: 0,
-        ),
-      ).listen(
-        (Position pos) {
-          if (!mounted) return;
+      // Step 2: If we don't have location yet, check local SQLite database
+      if (myLocation == null && mounted) {
+        try {
+          final cachedRecord = await OfflineLocationService.getLastCachedLocationRecord();
+          if (cachedRecord != null && SecurityValidator.isValidCoordinates(cachedRecord.latitude, cachedRecord.longitude)) {
+            if (myLocation == null && mounted) {
+              myLocation = LatLng(cachedRecord.latitude, cachedRecord.longitude);
+              myAccuracy = cachedRecord.accuracy;
+              if (lostDevice == null) {
+                _centerMap(myLocation!);
+              }
+            }
+          }
+        } catch (_) {}
+
+        if (mounted) {
+          setState(() {
+            if (statusMessage == "Checking your location...") {
+              statusMessage = myLocation != null ? "Ready. Enter device code." : "Acquiring live GPS fix...";
+            }
+          });
+        }
+      }
+
+      // Step 3: Attempt quick current GPS fix with short timeout
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 4),
+        );
+        if (mounted) {
           setState(() {
             myLocation = LatLng(pos.latitude, pos.longitude);
-
-            if (isLoading) {
-              isLoading = false;
-              statusMessage = "Ready. Enter device code.";
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (myLocation != null) {
-                  _mapController.move(myLocation!, 16.0);
-                }
-              });
-            }
-
+            myAccuracy = pos.accuracy;
+            statusMessage = "Live GPS Active";
             _recalcDistanceAndDirection();
+            if (lostDevice == null) {
+              _centerMap(myLocation!);
+            }
           });
-        },
-        onError: (e) {
-          if (mounted) {
-            setState(() => statusMessage = "GPS signal weak/offline");
-          }
-        },
-      );
-      _myLocationStreamStarting = false;
+        }
+      } catch (_) {}
+
+      // Step 4: Configure continuous live GNSS satellite stream with direct hardware fallback
+      final LocationSettings locationSettings = defaultTargetPlatform == TargetPlatform.android
+          ? AndroidSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 0,
+              forceLocationManager: false,
+              intervalDuration: const Duration(seconds: 2),
+            )
+          : const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 0,
+            );
+
+      _startPositionStreamWithFallback(locationSettings);
+
     } catch (e) {
       if (mounted) {
         setState(() {
-          isLoading = false;
-          statusMessage = "Location Error";
+          statusMessage = "Location Ready";
         });
       }
       _myLocationStreamStarting = false;
+    } finally {
+      _myLocationStreamStarting = false;
     }
+  }
+
+  void _startPositionStreamWithFallback(LocationSettings settings, {bool isRetry = false}) {
+    _myLocSub?.cancel();
+    _myLocSub = Geolocator.getPositionStream(locationSettings: settings).listen(
+      (Position pos) {
+        if (!mounted) return;
+        final isFirstFix = (myLocation == null);
+        setState(() {
+          myLocation = LatLng(pos.latitude, pos.longitude);
+          myAccuracy = pos.accuracy;
+
+          if (statusMessage == "Checking your location..." ||
+              statusMessage == "Acquiring live GPS fix..." ||
+              statusMessage == "Acquiring live GPS fix (Offline)..." ||
+              statusMessage == "GPS signal weak/offline" ||
+              statusMessage == "GPS satellite signal weak") {
+            statusMessage = "Live GPS Active";
+          }
+
+          _recalcDistanceAndDirection();
+
+          if (lostDevice == null && (isFirstFix || autoFollow)) {
+            _centerMap(myLocation!);
+          }
+        });
+      },
+      onError: (e) {
+        debugPrint("Location stream error: $e");
+        if (!isRetry && defaultTargetPlatform == TargetPlatform.android) {
+          debugPrint("Retrying location stream with hardware GPS provider (forceLocationManager=true)...");
+          final fallbackSettings = AndroidSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 0,
+            forceLocationManager: true,
+            intervalDuration: const Duration(seconds: 2),
+          );
+          _startPositionStreamWithFallback(fallbackSettings, isRetry: true);
+        } else {
+          if (mounted) {
+            setState(() {
+              statusMessage = "GPS satellite signal weak";
+            });
+          }
+        }
+      },
+    );
   }
 
   // ================= 2. TRACE DEVICE LOGIC =================
@@ -230,13 +355,30 @@ class _TracePageState extends State<TracePage> {
     _commandSub?.cancel();
     _locationHistorySub?.cancel();
 
+    // Check if the current/tracing device is in Offline Mode
+    bool isOnline = await SyncManager.instance.checkConnectionFast(
+      timeout: const Duration(milliseconds: 1200),
+    );
+
+    if (!isOnline) {
+      await _startOfflineTraceFlow(code);
+      return;
+    }
+
     try {
       final doc = await FirebaseFirestore.instance
           .collection('device_codes')
           .doc(code)
-          .get();
+          .get()
+          .timeout(const Duration(seconds: 3));
 
       if (!doc.exists) {
+        // If not found in Firestore online, test direct local connectivity before declaring invalid
+        final directTest = await OfflineDirectTraceService.instance.fetchDirectTelemetry(code);
+        if (directTest != null) {
+          await _startOfflineTraceFlow(code, initialTelemetry: directTest);
+          return;
+        }
         setState(() => statusMessage = "Invalid Device Code");
         return;
       }
@@ -275,7 +417,151 @@ class _TracePageState extends State<TracePage> {
         });
       }
     } catch (e) {
-      if (mounted) setState(() => statusMessage = "Unexpected Error");
+      // Network failure / Offline mode fallback
+      debugPrint("Firestore trace attempt encountered network error / offline ($e). Switching to Offline Trace Flow...");
+      await _startOfflineTraceFlow(code);
+    }
+  }
+
+  // ================= OFFLINE DIRECT TRACE & LAST SYNC FALLBACK FLOW =================
+
+  Future<void> _startOfflineTraceFlow(String code, {DirectTelemetry? initialTelemetry}) async {
+    _isOfflineDirectTrace = true;
+    isLost = true;
+    isTracingActive = true;
+
+    if (mounted) {
+      setState(() {
+        statusMessage = "Connecting directly to device...";
+      });
+    }
+
+    // 1. First attempt to obtain lost device telemetry through direct/local communication
+    DirectTelemetry? telemetry = initialTelemetry ?? await OfflineDirectTraceService.instance.fetchDirectTelemetry(code);
+
+    if (telemetry != null) {
+      _handleDirectTelemetry(telemetry);
+
+      // 2. Continuous direct telemetry polling (every 6s) while on Trace Page
+      OfflineDirectTraceService.instance.startPolling(
+        deviceCode: code,
+        onTelemetry: (t) {
+          if (mounted && _isOfflineDirectTrace) {
+            _handleDirectTelemetry(t);
+          }
+        },
+        onStatusUpdate: (msg) {
+          if (mounted && _isOfflineDirectTrace && _isDirectConnected) {
+            setState(() => statusMessage = msg);
+          }
+        },
+      );
+    } else {
+      // 3. Direct connection not available -> Gracefully fall back to last synchronized location
+      await _loadLastSynchronizedLocationFallback(code);
+
+      // Keep passive direct trace active in case the lost device comes in direct range
+      OfflineDirectTraceService.instance.startPolling(
+        deviceCode: code,
+        interval: const Duration(seconds: 8),
+        onTelemetry: (t) {
+          if (mounted && _isOfflineDirectTrace) {
+            _handleDirectTelemetry(t);
+          }
+        },
+        onStatusUpdate: (msg) {
+          if (mounted && _isOfflineDirectTrace && _isDirectConnected) {
+            setState(() => statusMessage = msg);
+          }
+        },
+      );
+    }
+  }
+
+  void _handleDirectTelemetry(DirectTelemetry t) {
+    if (!mounted) return;
+    final newPos = LatLng(t.latitude, t.longitude);
+    final bool validCoords = SecurityValidator.isValidCoordinates(t.latitude, t.longitude);
+
+    setState(() {
+      _isDirectConnected = true;
+      if (validCoords) {
+        _animateMarker(newPos);
+        lostDevice = newPos;
+        firstLocationReceived = true;
+        if (_locationHistoryPoints.isEmpty || _locationHistoryPoints.last != newPos) {
+          _locationHistoryPoints.add(newPos);
+        }
+      }
+      lostAccuracy = t.accuracy;
+      lostBattery = t.battery;
+      lostUpdatedAt = t.timestamp;
+      lostSpeed = t.speed;
+      lostHeading = t.heading;
+      isLastKnownLocation = !t.isLocationEnabled || t.gpsStatus == "DISABLED";
+      deviceStateText = t.isLocationEnabled ? "Direct Connection" : "GPS Disabled";
+      statusMessage = "Offline Mode \u2014 GPS Active";
+
+      _recalcDistanceAndDirection();
+
+      _fitMapToBothMarkers();
+    });
+  }
+
+  Future<void> _loadLastSynchronizedLocationFallback(String code) async {
+    _isDirectConnected = false;
+
+    // Try reading from Firestore offline cache (lost device's own document)
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('device_codes')
+          .doc(code)
+          .get(const GetOptions(source: Source.cache));
+
+      if (doc.exists && doc.data() != null) {
+        final data = doc.data()!;
+        final lastLoc = data['lastLocation'] as Map<String, dynamic>?;
+        final double? lat = (data['latitude'] as num?)?.toDouble()
+            ?? (lastLoc?['lat'] as num?)?.toDouble()
+            ?? (lastLoc?['latitude'] as num?)?.toDouble();
+        final double? lng = (data['longitude'] as num?)?.toDouble()
+            ?? (lastLoc?['lng'] as num?)?.toDouble()
+            ?? (lastLoc?['longitude'] as num?)?.toDouble();
+
+        if (lat != null && lng != null && SecurityValidator.isValidCoordinates(lat, lng)) {
+          final pos = LatLng(lat, lng);
+          final acc = (data['accuracy'] as num?)?.toDouble() ?? (data['lastLocation']?['accuracy'] as num?)?.toDouble() ?? 10.0;
+          final bat = (data['batteryLevel'] as num?)?.toInt() ?? (data['lastLocation']?['battery'] as num?)?.toInt() ?? 0;
+          final rawTs = data['timestamp'] ?? data['lastLocation']?['updatedAt'];
+          final ts = rawTs is Timestamp ? rawTs.toDate() : null;
+
+          if (mounted) {
+            setState(() {
+              _animateMarker(pos);
+              lostDevice = pos;
+              lostAccuracy = acc;
+              lostBattery = bat;
+              lostUpdatedAt = ts;
+              isLastKnownLocation = true;
+              deviceStateText = "Offline (${_formatRelativeAge(ts)})";
+              statusMessage = "Live location unavailable while offline";
+              firstLocationReceived = true;
+              _recalcDistanceAndDirection();
+              _fitMapToBothMarkers();
+            });
+          }
+          return;
+        }
+      }
+    } catch (_) {}
+
+    // 3. If no cached coordinates exist anywhere
+    if (mounted) {
+      setState(() {
+        isLastKnownLocation = true;
+        deviceStateText = "Offline";
+        statusMessage = "Live location unavailable while offline";
+      });
     }
   }
 
@@ -304,9 +590,11 @@ class _TracePageState extends State<TracePage> {
         final lastLocation = data['lastLocation'];
         final double? nestedLat = (lastLocation?['lat'] as num?)?.toDouble();
         final double? nestedLng = (lastLocation?['lng'] as num?)?.toDouble();
+        final double? nestedLat2 = (lastLocation?['latitude'] as num?)?.toDouble();
+        final double? nestedLng2 = (lastLocation?['longitude'] as num?)?.toDouble();
 
-        final double? lat = rootLat ?? nestedLat;
-        final double? lng = rootLng ?? nestedLng;
+        final double? lat = rootLat ?? nestedLat ?? nestedLat2;
+        final double? lng = rootLng ?? nestedLng ?? nestedLng2;
 
         final double? accuracy = (data['accuracy'] as num?)?.toDouble() ??
             (data['gpsAccuracy'] as num?)?.toDouble() ??
@@ -330,9 +618,12 @@ class _TracePageState extends State<TracePage> {
             data['lastSeen'] ??
             data['updatedAt'];
 
-        final DateTime? updatedAt = rawTimestamp is Timestamp
-            ? rawTimestamp.toDate()
-            : null;
+        DateTime? updatedAt;
+        if (rawTimestamp is Timestamp) {
+          updatedAt = rawTimestamp.toDate();
+        } else if (rawTimestamp is String) {
+          updatedAt = DateTime.tryParse(rawTimestamp);
+        }
 
         final now = DateTime.now();
         bool localLastKnown = false;
@@ -403,9 +694,7 @@ class _TracePageState extends State<TracePage> {
 
               _recalcDistanceAndDirection();
 
-              if (autoFollow && lostDevice != null) {
-                _mapController.move(lostDevice!, 16.0);
-              }
+              _fitMapToBothMarkers();
             });
           }
         } else {
@@ -536,7 +825,7 @@ class _TracePageState extends State<TracePage> {
   void _recalcDistanceAndDirection() {
     if (lostDevice == null || myLocation == null) return;
 
-    final meters = Geolocator.distanceBetween(
+    final rawMeters = Geolocator.distanceBetween(
       myLocation!.latitude,
       myLocation!.longitude,
       lostDevice!.latitude,
@@ -564,14 +853,25 @@ class _TracePageState extends State<TracePage> {
     final dirText = dirs[((bearing + 22.5) ~/ 45) % 8];
     final bearingDeg = ((bearing + 360) % 360).toStringAsFixed(0);
 
+    // Combined GPS horizontal uncertainty radius
+    final double myAcc = (myAccuracy != null && myAccuracy! > 0) ? myAccuracy! : 20.0;
+    final double lostAcc = (lostAccuracy != null && lostAccuracy! > 0) ? lostAccuracy! : 20.0;
+    final double totalUncertainty = myAcc + lostAcc;
+
+    // Always use the raw GPS-calculated distance — no artificial clamping
+    final double effectiveDistance = rawMeters;
+
     setState(() {
-      distance = meters;
-      direction = "$dirText ($bearingDeg°)";
+      distance = effectiveDistance;
+      // Only show "Nearby" when distance is genuinely within combined GPS uncertainty
+      direction = effectiveDistance <= totalUncertainty && effectiveDistance < 30
+          ? "Nearby (Within GPS accuracy range)"
+          : "$dirText ($bearingDeg\u00b0)";
       path = [myLocation!, lostDevice!];
     });
 
     // Feature 6 & 7: Check Distance Alerts
-    _checkDistanceAlerts(meters);
+    _checkDistanceAlerts(effectiveDistance);
   }
 
   // ================= 7. DISTANCE ALERTS & AUTO SOUND ALERT =================
@@ -601,6 +901,34 @@ class _TracePageState extends State<TracePage> {
     }
   }
 
+  // ================= 7B. AUTO-FIT MAP TO BOTH MARKERS =================
+
+  void _fitMapToBothMarkers() {
+    if (myLocation == null || lostDevice == null) return;
+    if (!autoFollow) return;
+
+    final rawMeters = Geolocator.distanceBetween(
+      myLocation!.latitude, myLocation!.longitude,
+      lostDevice!.latitude, lostDevice!.longitude,
+    );
+
+    try {
+      if (rawMeters > 100) {
+        // Devices are far apart — fit both markers in view
+        final bounds = LatLngBounds.fromPoints([myLocation!, lostDevice!]);
+        _mapController.fitCamera(
+          CameraFit.bounds(
+            bounds: bounds,
+            padding: const EdgeInsets.all(60),
+          ),
+        );
+      } else {
+        // Devices are close — center on lost device with normal zoom
+        _mapController.move(lostDevice!, 16.0);
+      }
+    } catch (_) {}
+  }
+
   // ================= 8. REMOTE PLAY SOUND ACTION =================
 
   Future<void> _toggleRemotePlaySound() async {
@@ -618,15 +946,24 @@ class _TracePageState extends State<TracePage> {
 
       if (mounted) {
         setState(() {
-          isPlaySoundActive = newPlayState;
           isSendingCommand = false;
         });
 
         _showMsg(
           newPlayState
-              ? "🔊 Playing loud alarm on lost device..."
-              : "🔇 Alarm stop command sent.",
+              ? "🔊 Alarm command sent. Waiting for device response..."
+              : "🔇 Stop alarm command sent.",
         );
+
+        // Timeout: if lost device doesn't respond in 8 seconds, warn the user
+        if (newPlayState) {
+          final capturedState = isPlaySoundActive;
+          Future.delayed(const Duration(seconds: 8), () {
+            if (mounted && !isPlaySoundActive && capturedState == false) {
+              _showMsg("⚠️ Lost device may not have received the alarm. Ensure tracking is active on the lost device.");
+            }
+          });
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -640,7 +977,9 @@ class _TracePageState extends State<TracePage> {
 
   String _formatDistance(double? meters) {
     if (meters == null) return "Calculating...";
-    if (meters < 15) {
+    if (meters < 1) {
+      return "< 1 m (Very Close)";
+    } else if (meters < 15) {
       return "${meters.toStringAsFixed(1)} m";
     } else if (meters < 1000) {
       return "${meters.toStringAsFixed(0)} m";
@@ -671,6 +1010,21 @@ class _TracePageState extends State<TracePage> {
     }
   }
 
+  Future<void> _sendSmsCommand(String cmd) async {
+    final code = _controller.text.trim().toUpperCase();
+    final message = code.isNotEmpty ? "$cmd $code" : cmd;
+    final uri = Uri.parse("sms:?body=${Uri.encodeComponent(message)}");
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        _showMsg("Unable to open SMS application");
+      }
+    } catch (e) {
+      _showMsg("SMS launcher error: $e");
+    }
+  }
+
   void _showMsg(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -687,27 +1041,6 @@ class _TracePageState extends State<TracePage> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    if (isLoading) {
-      return Scaffold(
-        backgroundColor: isDark
-            ? const Color(0xff121212)
-            : const Color(0xffF3F6FF),
-        body: const Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              CircularProgressIndicator(color: Color(0xff1A56DB)),
-              SizedBox(height: 15),
-              Text(
-                "Getting your live location...",
-                style: TextStyle(color: Colors.grey),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
 
     final initialMapCenter = lostDevice ?? myLocation ?? const LatLng(20.5937, 78.9629);
 
@@ -730,6 +1063,7 @@ class _TracePageState extends State<TracePage> {
       ),
       body: Column(
         children: [
+          const OfflineStatusBanner(),
           // CODE SEARCH BAR
           Container(
             padding: const EdgeInsets.fromLTRB(20, 10, 20, 25),
@@ -811,17 +1145,51 @@ class _TracePageState extends State<TracePage> {
                           ),
                           const SizedBox(width: 10),
                           Expanded(
-                            child: Text(
-                              isLastKnownLocation
-                                  ? "LAST KNOWN LOCATION ($deviceStateText)"
-                                  : "LIVE LOCATION ACTIVE",
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                                color: isLastKnownLocation
-                                    ? Colors.orange.shade900
-                                    : Colors.green.shade900,
-                              ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  isLastKnownLocation
+                                      ? (cellTowerInfoText != null
+                                          ? "Approximate Location (Cell Tower Fallback)"
+                                          : (_isOfflineDirectTrace && !_isDirectConnected
+                                              ? "LAST KNOWN LOCATION (Showing last synchronized location)"
+                                              : "LAST KNOWN LOCATION ($deviceStateText)"))
+                                      : (_isDirectConnected
+                                          ? "OFFLINE DIRECT TRACE ACTIVE"
+                                          : "LIVE LOCATION ACTIVE"),
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                    color: isLastKnownLocation
+                                        ? Colors.orange.shade900
+                                        : Colors.green.shade900,
+                                  ),
+                                ),
+                                if (isLastKnownLocation) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _isOfflineDirectTrace && !_isDirectConnected
+                                        ? "⚠️ Live location unavailable while offline. Showing last synchronized location."
+                                        : "⚠️ Live tracking unavailable. Showing last synchronized location.",
+                                    style: TextStyle(
+                                      color: Colors.orange.shade900,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ] else if (_isDirectConnected) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    "⚡ Live location received directly via local connection.",
+                                    style: TextStyle(
+                                      color: Colors.green.shade900,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
                         ],
@@ -832,6 +1200,9 @@ class _TracePageState extends State<TracePage> {
 
                   // SMART THEFT RISK SCORE CARD
                   _buildTheftRiskCard(isDark),
+
+                  // BLE COMMUNITY DETECTION CARD (PHASE 3)
+                  CommunityDetectionCard(deviceCode: _controller.text.trim()),
 
                   // MOVEMENT PREDICTION CARD
                   _buildMovementPredictionCard(isDark),
@@ -921,7 +1292,7 @@ class _TracePageState extends State<TracePage> {
 
                   // LIVE MAP (FEATURE 3, 9, 12)
                   Container(
-                    height: 320,
+                    height: 340,
                     decoration: BoxDecoration(
                       color: isDark ? const Color(0xff1E1E1E) : Colors.white,
                       borderRadius: BorderRadius.circular(25),
@@ -938,115 +1309,191 @@ class _TracePageState extends State<TracePage> {
                     ),
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(20),
-                      child: FlutterMap(
-                        mapController: _mapController,
-                        options: MapOptions(
-                          initialCenter: initialMapCenter,
-                          initialZoom: 16.0,
-                        ),
+                      child: Stack(
                         children: [
-                          TileLayer(
-                            urlTemplate:
-                                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                            userAgentPackageName: 'com.example.fincell',
+                          FlutterMap(
+                            mapController: _mapController,
+                            options: MapOptions(
+                              initialCenter: initialMapCenter,
+                              initialZoom: 16.0,
+                            ),
+                            children: [
+                              TileLayer(
+                                urlTemplate:
+                                    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                                userAgentPackageName: 'com.example.fincell',
+                                tileProvider: CachedTileProvider(),
+                              ),
+
+                              // GPS Accuracy Radius Circles
+                              CircleLayer(
+                                circles: [
+                                  if (myLocation != null)
+                                    CircleMarker(
+                                      point: myLocation!,
+                                      radius: (myAccuracy ?? 25.0).clamp(10.0, 150.0),
+                                      useRadiusInMeter: true,
+                                      color: Colors.blue.withValues(alpha: 0.18),
+                                      borderColor: Colors.blueAccent.withValues(alpha: 0.7),
+                                      borderStrokeWidth: 2.0,
+                                    ),
+                                  if (animatedDevice != null || lostDevice != null)
+                                    CircleMarker(
+                                      point: animatedDevice ?? lostDevice!,
+                                      radius: (lostAccuracy ?? 20.0).clamp(10.0, 150.0),
+                                      useRadiusInMeter: true,
+                                      color: Colors.red.withValues(alpha: 0.18),
+                                      borderColor: Colors.redAccent.withValues(alpha: 0.7),
+                                      borderStrokeWidth: 2.0,
+                                    ),
+                                ],
+                              ),
+
+                              if (path.isNotEmpty && path.length > 1)
+                                PolylineLayer(
+                                  polylines: [
+                                    Polyline(
+                                      points: path,
+                                      strokeWidth: 5,
+                                      color: Colors.indigoAccent,
+                                      pattern: StrokePattern.dashed(
+                                        segments: const [12.0, 12.0],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+
+                              MarkerLayer(
+                                markers: [
+                                  if (animatedDevice != null)
+                                    Marker(
+                                      point: animatedDevice!,
+                                      width: 80,
+                                      height: 80,
+                                      child: Column(
+                                        children: [
+                                          const Icon(
+                                            Icons.location_on,
+                                            color: Colors.red,
+                                            size: 45,
+                                          ),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 4,
+                                              vertical: 2,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white,
+                                              borderRadius: BorderRadius.circular(4),
+                                              boxShadow: const [
+                                                BoxShadow(
+                                                  color: Colors.black26,
+                                                  blurRadius: 4,
+                                                )
+                                              ],
+                                            ),
+                                            child: const Text(
+                                              "LOST DEVICE",
+                                              style: TextStyle(
+                                                fontSize: 8,
+                                                fontWeight: FontWeight.bold,
+                                                color: Colors.red,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+
+                                  if (myLocation != null)
+                                    Marker(
+                                      point: myLocation!,
+                                      width: 80,
+                                      height: 80,
+                                      child: Column(
+                                        children: [
+                                          Container(
+                                            padding: const EdgeInsets.all(4),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white,
+                                              shape: BoxShape.circle,
+                                              boxShadow: [
+                                                BoxShadow(
+                                                  color: Colors.blue.withValues(alpha: 0.4),
+                                                  blurRadius: 10,
+                                                  spreadRadius: 3,
+                                                ),
+                                              ],
+                                            ),
+                                            child: const Icon(
+                                              Icons.my_location,
+                                              color: Color(0xff1A56DB),
+                                              size: 32,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 3),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 5,
+                                              vertical: 2,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xff1A56DB),
+                                              borderRadius: BorderRadius.circular(6),
+                                              boxShadow: const [
+                                                BoxShadow(
+                                                  color: Colors.black26,
+                                                  blurRadius: 4,
+                                                )
+                                              ],
+                                            ),
+                                            child: const Text(
+                                              "YOU (Live GPS)",
+                                              style: TextStyle(
+                                                fontSize: 8,
+                                                fontWeight: FontWeight.bold,
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ],
                           ),
 
-                          if (path.isNotEmpty && path.length > 1)
-                            PolylineLayer(
-                              polylines: [
-                                Polyline(
-                                  points: path,
-                                  strokeWidth: 5,
-                                  color: Colors.indigoAccent,
-                                  pattern: StrokePattern.dashed(
-                                    segments: const [12.0, 12.0],
+                          // Floating Re-Center / GPS Button
+                          Positioned(
+                            bottom: 12,
+                            right: 12,
+                            child: Material(
+                              color: isDark ? const Color(0xff2A2A2A) : Colors.white,
+                              shape: const CircleBorder(),
+                              elevation: 4,
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () {
+                                  final target = myLocation ?? lostDevice;
+                                  if (target != null) {
+                                    _centerMap(target, 16.5);
+                                    _showMsg("Centered on Live GPS location");
+                                  } else {
+                                    _initMyLocationStream();
+                                    _showMsg("Acquiring GPS location...");
+                                  }
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.all(10),
+                                  child: const Icon(
+                                    Icons.my_location,
+                                    color: Color(0xff1A56DB),
+                                    size: 24,
                                   ),
                                 ),
-                              ],
+                              ),
                             ),
-
-                          MarkerLayer(
-                            markers: [
-                              if (animatedDevice != null)
-                                Marker(
-                                  point: animatedDevice!,
-                                  width: 80,
-                                  height: 80,
-                                  child: Column(
-                                    children: [
-                                      const Icon(
-                                        Icons.location_on,
-                                        color: Colors.red,
-                                        size: 45,
-                                      ),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 4,
-                                          vertical: 2,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: Colors.white,
-                                          borderRadius: BorderRadius.circular(4),
-                                          boxShadow: const [
-                                            BoxShadow(
-                                              color: Colors.black26,
-                                              blurRadius: 4,
-                                            )
-                                          ],
-                                        ),
-                                        child: const Text(
-                                          "LOST DEVICE",
-                                          style: TextStyle(
-                                            fontSize: 8,
-                                            fontWeight: FontWeight.bold,
-                                            color: Colors.red,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-
-                              if (myLocation != null)
-                                Marker(
-                                  point: myLocation!,
-                                  width: 80,
-                                  height: 80,
-                                  child: Column(
-                                    children: [
-                                      const Icon(
-                                        Icons.person_pin_circle,
-                                        color: Colors.blue,
-                                        size: 45,
-                                      ),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 4,
-                                          vertical: 2,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: Colors.white,
-                                          borderRadius: BorderRadius.circular(4),
-                                          boxShadow: const [
-                                            BoxShadow(
-                                              color: Colors.black26,
-                                              blurRadius: 4,
-                                            )
-                                          ],
-                                        ),
-                                        child: const Text(
-                                          "YOU",
-                                          style: TextStyle(
-                                            fontSize: 9,
-                                            fontWeight: FontWeight.bold,
-                                            color: Colors.blue,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                            ],
                           ),
                         ],
                       ),
@@ -1121,8 +1568,14 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.wifi_tethering,
             "Lost Device Status",
-            deviceStateText,
-            isLastKnownLocation ? Colors.orange : Colors.green,
+            lostDevice != null
+                ? (_isDirectConnected
+                    ? "Direct Connection"
+                    : (isLastKnownLocation ? "Offline" : deviceStateText))
+                : "Enter Device Code to Trace",
+            lostDevice != null
+                ? (isLastKnownLocation ? Colors.orange : Colors.green)
+                : Colors.grey,
           ),
           const Divider(height: 20),
 
@@ -1130,7 +1583,7 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.person_pin,
             "Current Device Status",
-            myLocation != null ? "GPS Active" : "Searching GPS...",
+            myLocation != null ? "GPS Active (Live)" : "Searching GPS...",
             myLocation != null ? Colors.blue : Colors.orange,
           ),
           const Divider(height: 20),
@@ -1139,7 +1592,7 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.straighten,
             "Distance",
-            _formatDistance(distance),
+            lostDevice != null ? _formatDistance(distance) : "Enter Device Code",
             isDark ? Colors.white : Colors.black87,
           ),
           const Divider(height: 20),
@@ -1149,8 +1602,10 @@ class _TracePageState extends State<TracePage> {
             Icons.gps_fixed,
             "GPS Accuracy",
             lostAccuracy != null
-                ? "± ${lostAccuracy!.toStringAsFixed(0)} m"
-                : "Waiting...",
+                ? "± ${lostAccuracy!.toStringAsFixed(0)} m (Lost Device)"
+                : (myAccuracy != null
+                    ? "± ${myAccuracy!.toStringAsFixed(0)} m (Live GPS)"
+                    : (isLastKnownLocation ? "± 10 m (Last Sync)" : "Waiting...")),
             const Color(0xff1A56DB),
           ),
           const Divider(height: 20),
@@ -1159,7 +1614,9 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.update,
             "Last Updated Time",
-            _formatRelativeAge(lostUpdatedAt),
+            lostUpdatedAt != null
+                ? _formatRelativeAge(lostUpdatedAt)
+                : (myLocation != null ? "Live (This Device)" : (isLastKnownLocation ? "Last Synced" : "Unknown")),
             isDark ? Colors.white : Colors.black87,
           ),
           const Divider(height: 20),
@@ -1168,7 +1625,9 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.battery_full,
             "Battery Level",
-            lostBattery != null ? "$lostBattery%" : "Waiting...",
+            lostBattery != null
+                ? "$lostBattery%"
+                : (myLocation != null ? "Present Device Active" : (isLastKnownLocation ? "Unavailable" : "Waiting...")),
             isDark ? Colors.white : Colors.black87,
           ),
           const Divider(height: 20),
@@ -1177,7 +1636,7 @@ class _TracePageState extends State<TracePage> {
             isDark,
             Icons.explore_outlined,
             "Live Direction",
-            direction ?? "Detecting...",
+            direction ?? (lostDevice != null ? (isLastKnownLocation ? "Unknown" : "Detecting...") : "Ready to Trace"),
             const Color(0xff1A56DB),
           ),
         ],
@@ -1648,6 +2107,79 @@ class _TracePageState extends State<TracePage> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 10),
+          // OFFLINE SMS EMERGENCY TRIGGERS
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isDark ? const Color(0xff1A1A2E) : const Color(0xffEBF3FF),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xff1A56DB).withValues(alpha: 0.3)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: const [
+                    Icon(Icons.sms_outlined, color: Color(0xff1A56DB), size: 16),
+                    SizedBox(width: 6),
+                    Text(
+                      "OFF-GRID SMS EMERGENCY TRIGGERS",
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xff1A56DB),
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () => _sendSmsCommand("#LOC#"),
+                        icon: const Icon(Icons.pin_drop, size: 14, color: Colors.white),
+                        label: const Text("SMS #LOC#", style: TextStyle(fontSize: 11, color: Colors.white)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xff1A56DB),
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () => _sendSmsCommand("#ALARM#"),
+                        icon: const Icon(Icons.volume_up, size: 14, color: Colors.white),
+                        label: const Text("SMS #ALARM#", style: TextStyle(fontSize: 11, color: Colors.white)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent,
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () => _sendSmsCommand("#CAM#"),
+                        icon: const Icon(Icons.camera, size: 14, color: Colors.white),
+                        label: const Text("SMS #CAM#", style: TextStyle(fontSize: 11, color: Colors.white)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.deepPurple,
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ],
       ),

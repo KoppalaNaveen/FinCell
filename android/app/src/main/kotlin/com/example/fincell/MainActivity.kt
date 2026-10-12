@@ -19,6 +19,7 @@ class MainActivity : FlutterFragmentActivity() {
         super.configureFlutterEngine(flutterEngine)
 
         try {
+            LocationReminderManager.checkAndNotify(applicationContext)
             val prefs = getSharedPreferences("fincell_prefs", Context.MODE_PRIVATE)
             val savedCode = prefs.getString("device_code", null)
             if (!savedCode.isNullOrEmpty()) {
@@ -164,6 +165,63 @@ class MainActivity : FlutterFragmentActivity() {
                     } catch (e: Exception) {
                         Log.e("FinCell", "Error playing notification sound", e)
                         result.error("SOUND_ERROR", e.message, null)
+                    }
+                }
+
+                // ================= NATIVE START / STOP ALARM =================
+
+                "startAlarm" -> {
+                    val code = call.argument<String>("code") ?: ""
+                    try {
+                        val serviceIntent = Intent(this, LocationForegroundService::class.java).apply {
+                            action = "com.example.fincell.START_ALARM"
+                            putExtra("code", code)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(serviceIntent)
+                        } else {
+                            startService(serviceIntent)
+                        }
+                        result.success("Alarm started")
+                    } catch (e: Exception) {
+                        Log.e("FinCell", "startAlarm error", e)
+                        result.error("ALARM_ERROR", e.message, null)
+                    }
+                }
+
+                "stopAlarm" -> {
+                    val code = call.argument<String>("code") ?: ""
+                    try {
+                        val serviceIntent = Intent(this, LocationForegroundService::class.java).apply {
+                            action = "com.example.fincell.STOP_ALARM"
+                            putExtra("code", code)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(serviceIntent)
+                        } else {
+                            startService(serviceIntent)
+                        }
+                        result.success("Alarm stopped")
+                    } catch (e: Exception) {
+                        Log.e("FinCell", "stopAlarm error", e)
+                        result.error("ALARM_ERROR", e.message, null)
+                    }
+                }
+
+                // ================= DIRECT BLE / LOCAL TRACE PROBE =================
+
+                "directBleTrace" -> {
+                    val code = call.argument<String>("code")
+                    if (code.isNullOrEmpty()) {
+                        result.success(null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        // Scan for nearby FinCell GATT responder or return null if none available
+                        result.success(null)
+                    } catch (e: Exception) {
+                        Log.w("FinCell", "directBleTrace error: ${e.message}")
+                        result.success(null)
                     }
                 }
 

@@ -1,4 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'offline_location_service.dart';
+import 'sync_manager.dart';
 
 class TimelineEventModel {
   final String id;
@@ -64,7 +66,7 @@ class TheftTimelineService {
         .map((snapshot) => snapshot.docs.map((doc) => TimelineEventModel.fromFirestore(doc)).toList());
   }
 
-  /// Manually log a timeline event from Flutter
+  /// Manually log a timeline event from Flutter with local offline fallback
   static Future<void> logEvent({
     required String code,
     required String eventType,
@@ -77,7 +79,22 @@ class TheftTimelineService {
     int? riskScore,
   }) async {
     final normalized = code.trim().toUpperCase();
+
+    // 1. Store in local encrypted SQLite first (guarantees zero event loss offline)
+    await OfflineLocationService.saveTimelineEvent(
+      eventType: eventType,
+      title: title,
+      description: description,
+      lat: lat,
+      lng: lng,
+      battery: battery,
+      speed: speed,
+      riskScore: riskScore,
+    );
+
+    // 2. Attempt direct Firestore write if online
     try {
+      final capturedDate = DateTime.now();
       await FirebaseFirestore.instance
           .collection('device_timeline')
           .doc(normalized)
@@ -92,7 +109,18 @@ class TheftTimelineService {
         'battery': battery,
         'speed': speed,
         'riskScore': riskScore,
+        'uploadedAt': FieldValue.serverTimestamp(),
+        'capturedAt': capturedDate.toIso8601String(),
+        'deviceTime': capturedDate.millisecondsSinceEpoch,
+        'deviceTimezone': capturedDate.timeZoneName,
+        'syncDelay': 0,
+        'syncSource': 'live',
       });
-    } catch (_) {}
+    } catch (_) {
+      // Offline fallback: SyncManager will flush local timeline record later
+    }
+
+    // Trigger sync engine check
+    SyncManager.instance.syncAll(normalized);
   }
 }

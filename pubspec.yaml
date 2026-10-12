@@ -6,7 +6,6 @@ version: 1.0.0+1
 environment:
   sdk: ^3.10.8
 
-
 dependencies:
   flutter:
     sdk: flutter
@@ -36,22 +35,21 @@ dependencies:
   path: ^1.8.3
   android_intent_plus: ^4.0.0
   cloud_functions: ^4.7.0
+  crypto: ^3.0.3
+  audioplayers: ^6.0.0
+  battery_plus: ^6.0.2
 
-  
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_launcher_icons: ^0.13.1
-  
   flutter_lints: ^6.0.0
 
-
-
 flutter:
-
   uses-material-design: true
   assets:
     - assets/icon/fincell_icon.png
+    - assets/icon/google_logo.png
 
 flutter_icons:
   android: true

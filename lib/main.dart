@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 import 'auth/auth_gate.dart';
-import 'auth/login_page.dart';
-import 'services/permission_service.dart';
-// 🔥 ADD THIS IMPORT AT TOP
 import 'services/background_service.dart';
+import 'services/sync_manager.dart';
+import 'services/ble_community_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,11 +14,9 @@ Future<void> main() async {
   // 🔥 DO NOT wrap this in try-catch
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
-  FirebaseFirestore.instance.settings = const Settings(
-    persistenceEnabled: true,
-  );
-
   BackgroundTracking.initializeNativeListener();
+  SyncManager.instance.init();
+  BLECommunityService.instance.startScanning();
 
   runApp(const FinCellApp());
 }
@@ -40,25 +36,6 @@ class _FinCellAppState extends State<FinCellApp> {
     super.initState();
 
     _loadTheme();
-    _initialSetup();
-  }
-
-  // ================= FIRST RUN SETUP =================
-
-  Future<void> _initialSetup() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-
-      final isFirstRun = prefs.getBool('isFirstRun') ?? true;
-
-      if (isFirstRun) {
-        await PermissionService.requestLocationPermissionsProperly();
-        await PermissionService.requestDisableBatteryOptimization();
-        await prefs.setBool('isFirstRun', false);
-      }
-    } catch (e) {
-      debugPrint("Initial setup error: $e");
-    }
   }
 
   // ================= THEME LOAD =================
@@ -134,7 +111,7 @@ class _FinCellAppState extends State<FinCellApp> {
       home: AuthGate(onThemeChanged: _changeTheme),
 
       routes: {
-        '/login': (_) => const LoginPage(),
+        '/login': (_) => AuthGate(onThemeChanged: _changeTheme),
         '/auth': (_) => AuthGate(onThemeChanged: _changeTheme),
       },
     );

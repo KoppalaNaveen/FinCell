@@ -96,8 +96,21 @@ class _LoginPageState extends State<LoginPage> {
         userCredential = await FirebaseAuth.instance
             .createUserWithEmailAndPassword(email: email, password: password);
 
+        // 🔥 Create user document in Firestore immediately on signup
+        final newUser = userCredential.user;
+        if (newUser != null) {
+          try {
+            await AuthService.ensureUserDocument(newUser);
+          } catch (e) {
+            debugPrint("Signup user document creation error: $e");
+          }
+        }
+
         // 🔥 SEND VERIFICATION EMAIL
         await userCredential.user!.sendEmailVerification();
+
+        // Sign out so the user must verify email before accessing the app
+        await FirebaseAuth.instance.signOut();
 
         if (mounted) {
           setState(() {
@@ -112,10 +125,30 @@ class _LoginPageState extends State<LoginPage> {
       final user = FirebaseAuth.instance.currentUser;
 
       if (user != null) {
-        await DeviceService.registerDevice();
+        // 🔥 Ensure user document exists in Firestore (covers email login path)
+        try {
+          await AuthService.ensureUserDocument(user);
+        } catch (e) {
+          debugPrint("Login ensureUserDocument error: $e");
+        }
+
+        try {
+          await DeviceService.registerDevice().timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
+          );
+        } catch (e) {
+          debugPrint("Login device registration error: $e");
+        }
 
         if (!kIsWeb) {
-          await LocationPermissionHelper.request();
+          try {
+            await LocationPermissionHelper.request().timeout(
+              const Duration(seconds: 4),
+            );
+          } catch (e) {
+            debugPrint("Login permission request error: $e");
+          }
         }
       }
     } on FirebaseAuthException catch (e) {
@@ -143,7 +176,7 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  // ================= GOOGLE LOGIN old=================
+  // ================= GOOGLE LOGIN =================
 
   Future<void> _googleLogin() async {
     try {
@@ -155,13 +188,83 @@ class _LoginPageState extends State<LoginPage> {
       final user = await AuthService().signInWithGoogle();
 
       if (user != null) {
-        await DeviceService.registerDevice();
+        try {
+          await DeviceService.registerDevice().timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
+          );
+        } catch (e) {
+          debugPrint("Google login device registration error: $e");
+        }
+
         if (!kIsWeb) {
-          await LocationPermissionHelper.request();
+          try {
+            await LocationPermissionHelper.request().timeout(
+              const Duration(seconds: 4),
+            );
+          } catch (e) {
+            debugPrint("Google login permission request error: $e");
+          }
         }
       }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() => error = e.message ?? "Google Sign-In failed.");
+      }
     } catch (e) {
-      setState(() => error = "Google Sign-In failed.");
+      if (mounted) {
+        setState(() => error = "Google Sign-In failed: $e");
+      }
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+  // ================= GUEST LOGIN =================
+
+  Future<void> _guestLogin() async {
+    try {
+      setState(() {
+        error = "";
+        isLoading = true;
+      });
+
+      final user = await AuthService().signInAnonymously();
+
+      if (user != null) {
+        try {
+          await DeviceService.registerDevice().timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
+          );
+        } catch (e) {
+          debugPrint("Guest login device registration error: $e");
+        }
+
+        if (!kIsWeb) {
+          try {
+            await LocationPermissionHelper.request().timeout(
+              const Duration(seconds: 4),
+            );
+          } catch (e) {
+            debugPrint("Guest login permission request error: $e");
+          }
+        }
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() {
+          if (e.code == 'admin-restricted-operation') {
+            error = "Guest sign-in is currently unavailable. Please use Google Sign-In or create an account.";
+          } else {
+            error = e.message ?? "Guest Sign-In failed.";
+          }
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => error = "Guest Sign-In failed: $e");
+      }
     } finally {
       if (mounted) setState(() => isLoading = false);
     }
@@ -180,7 +283,7 @@ class _LoginPageState extends State<LoginPage> {
         const SnackBar(content: Text("Password reset email sent!")),
       );
     } catch (e) {
-      setState(() => error = "Failed to send reset email.");
+      setState(() => error = "Password reset failed");
     }
   }
 
@@ -190,11 +293,11 @@ class _LoginPageState extends State<LoginPage> {
       child: Row(
         children: [
           Icon(
-            valid ? Icons.check_circle : Icons.circle,
+            valid ? Icons.check_circle : Icons.circle_outlined,
             size: 14,
-            color: valid ? Colors.green : Colors.grey,
+            color: valid ? Colors.green : Colors.black45, // 🔥 Black/Grey
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
           Text(
             text,
             style: TextStyle(
@@ -280,7 +383,6 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: Colors.black26),
                     ),
                   ),
                 ),
@@ -306,7 +408,6 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: Colors.black26),
                     ),
                     suffixIcon: IconButton(
                       icon: Icon(
@@ -352,19 +453,20 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                 ],
 
-                const SizedBox(height: 20),
-                if (error.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: Text(
-                      error,
-                      style: const TextStyle(
-                        color: Colors.redAccent,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
+                if (error.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  Text(
+                    error,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.redAccent,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
                     ),
                   ),
+                ],
+
+                const SizedBox(height: 24),
 
                 // SUBMIT BUTTON
                 SizedBox(
@@ -372,28 +474,27 @@ class _LoginPageState extends State<LoginPage> {
                   height: 52,
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xff1E88E5),
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      backgroundColor: const Color(0xff1E88E5),
-                      foregroundColor: Colors.white,
-                      elevation: 0,
                     ),
                     onPressed: isLoading ? null : _submit,
                     child: isLoading
                         ? const SizedBox(
-                            height: 20,
-                            width: 20,
+                            width: 22,
+                            height: 22,
                             child: CircularProgressIndicator(
                               color: Colors.white,
-                              strokeWidth: 2,
+                              strokeWidth: 2.5,
                             ),
                           )
                         : Text(
-                            isLogin ? "Login" : "Register",
+                            isLogin ? "Login" : "Create Account",
                             style: const TextStyle(
                               fontSize: 16,
                               fontWeight: FontWeight.bold,
+                              color: Colors.white,
                             ),
                           ),
                   ),
@@ -446,36 +547,112 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 const SizedBox(height: 20),
 
-                // GOOGLE LOGIN
+                // GOOGLE LOGIN BUTTON WITH OFFICIAL GOOGLE LOGO
                 SizedBox(
                   width: double.infinity,
                   height: 52,
                   child: OutlinedButton.icon(
                     style: OutlinedButton.styleFrom(
+                      backgroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      side: const BorderSide(color: Colors.black12),
+                      side: const BorderSide(color: Colors.black12, width: 1.2),
+                      elevation: 0,
                     ),
-                    icon: const Icon(
-                      Icons.login_rounded,
-                      size: 20,
-                      color: Colors.blueAccent,
-                    ),
+                    icon: const GoogleBrandLogo(size: 22),
                     label: const Text(
                       "Continue with Google",
                       style: TextStyle(
                         color: Colors.black87,
-                        fontWeight: FontWeight.w500,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.2,
                       ),
                     ),
                     onPressed: isLoading ? null : _googleLogin,
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                // GUEST LOGIN BUTTON
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      side: const BorderSide(color: Colors.black12, width: 1.2),
+                      elevation: 0,
+                    ),
+                    icon: const Icon(
+                      Icons.person_outline,
+                      color: Colors.black87,
+                      size: 22,
+                    ),
+                    label: const Text(
+                      "Continue as Guest",
+                      style: TextStyle(
+                        color: Colors.black87,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                    onPressed: isLoading ? null : _guestLogin,
                   ),
                 ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Dynamically renders the official Google brand logo.
+/// Connects directly to Google's official CDN (`gstatic`) so any visual or branding
+/// updates published by Google are automatically fetched and reflected live.
+/// Seamlessly falls back to the high-resolution local asset if offline.
+class GoogleBrandLogo extends StatelessWidget {
+  final double size;
+  const GoogleBrandLogo({super.key, this.size = 22});
+
+  static const String _officialGoogleCdnUrl =
+      'https://www.gstatic.com/images/branding/product/2x/googleg_96dp.png';
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Image.network(
+        _officialGoogleCdnUrl,
+        width: size,
+        height: size,
+        fit: BoxFit.contain,
+        errorBuilder: (context, error, stackTrace) {
+          return Image.asset(
+            'assets/icon/google_logo.png',
+            width: size,
+            height: size,
+            fit: BoxFit.contain,
+          );
+        },
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return Image.asset(
+            'assets/icon/google_logo.png',
+            width: size,
+            height: size,
+            fit: BoxFit.contain,
+          );
+        },
       ),
     );
   }

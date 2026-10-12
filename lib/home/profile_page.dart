@@ -16,6 +16,9 @@ import '../services/code_service.dart';
 import '../services/background_service.dart';
 import '../services/location_service.dart';
 import '../services/offline_location_service.dart';
+import '../services/storage_quota_service.dart';
+import '../services/auth_service.dart';
+import 'forensic_media_page.dart';
 import '../auth/auth_gate.dart';
 
 class ProfilePage extends StatefulWidget {
@@ -68,7 +71,9 @@ class _ProfilePageState extends State<ProfilePage> {
 
       if (user != null) {
         final cachedCode =
+            prefs.getString('device_bound_code') ??
             prefs.getString('uniqueCode') ??
+            prefs.getString('device_code') ??
             prefs.getString('cached_code_${user.uid}');
         if (cachedCode != null && cachedCode.isNotEmpty) {
           _codeController.text = cachedCode;
@@ -92,6 +97,15 @@ class _ProfilePageState extends State<ProfilePage> {
           const Duration(seconds: 3),
           onTimeout: () => "device_${DateTime.now().millisecondsSinceEpoch}",
         );
+
+        if (user != null && deviceId != null) {
+          final boundCode = await CodeService.ensureDeviceBoundCodeForUser(user.uid, deviceId!);
+          if (boundCode != null && boundCode.isNotEmpty && mounted) {
+            setState(() {
+              _codeController.text = boundCode;
+            });
+          }
+        }
       } catch (e) {
         debugPrint("Device registration notice: $e");
       }
@@ -261,7 +275,7 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Future<void> _logout() async {
     if (!_canPerformAction()) return;
-    await FirebaseAuth.instance.signOut();
+    await AuthService().signOut();
     if (mounted) {
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(
@@ -286,9 +300,10 @@ class _ProfilePageState extends State<ProfilePage> {
       return;
     }
 
-    bool isGoogleUser = user.providerData.any(
+    final bool isGoogleUser = user.providerData.any(
       (p) => p.providerId == 'google.com',
     );
+    final bool isAnonymous = user.isAnonymous || user.providerData.isEmpty;
     final passwordController = TextEditingController();
     bool obscurePassword = true;
 
@@ -303,8 +318,8 @@ class _ProfilePageState extends State<ProfilePage> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text("This will permanently delete your account."),
-              if (!isGoogleUser)
+              const Text("This will permanently delete your account and all associated device data."),
+              if (!isGoogleUser && !isAnonymous)
                 Padding(
                   padding: const EdgeInsets.only(top: 15),
                   child: TextField(
@@ -327,11 +342,13 @@ class _ProfilePageState extends State<ProfilePage> {
                   ),
                 )
               else
-                const Padding(
-                  padding: EdgeInsets.only(top: 15),
+                Padding(
+                  padding: const EdgeInsets.only(top: 15),
                   child: Text(
-                    "Linked with Google: No password required.",
-                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                    isAnonymous
+                        ? "Guest Account: No password required."
+                        : "Linked with Google: No password required.",
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
                   ),
                 ),
             ],
@@ -362,38 +379,127 @@ class _ProfilePageState extends State<ProfilePage> {
     final password = passwordController.text.trim();
     passwordController.dispose();
 
+    // Cancel active user document listener so deletion doesn't trigger unexpected state updates
+    _userListener?.cancel();
+    _userListener = null;
+
     try {
       setState(() => loading = true);
 
-      debugPrint("Delete Account Started");
+      debugPrint("=== Delete Account Process Started ===");
       debugPrint("Current UID: ${user.uid}");
 
-      if (!isGoogleUser && password.isNotEmpty) {
-        await _reauthenticateForDeletion(user, password);
+      // Step 1: Re-authenticate if password user
+      debugPrint("[Step 1/7] Re-authenticating User...");
+      if (!isGoogleUser && !isAnonymous && password.isNotEmpty) {
+        try {
+          await _reauthenticateForDeletion(user, password).timeout(
+            const Duration(seconds: 6),
+          );
+        } catch (e) {
+          debugPrint("Re-auth notice: $e");
+        }
       }
+      debugPrint("Success: [Step 1/7] Re-authentication Completed");
 
       final currentCode = await _resolveDeviceCodeForDeletion(user);
 
-      await _stopForegroundServices(currentCode, allowStatusWrite: true);
-      await _deleteFirestoreAccountData(uid: user.uid, deviceCode: currentCode);
-      await _deleteStorageFiles(uid: user.uid, deviceCode: currentCode);
-      await _deleteFirebaseAuthUserWithRetry(user, password);
-      await _clearLocalAccountData();
-      await _stopForegroundServices(currentCode, allowStatusWrite: false);
+      // Step 2: Stop Foreground & Background Services
+      debugPrint("[Step 2/7] Stopping Background Services...");
+      try {
+        await _stopForegroundServices(currentCode, allowStatusWrite: true).timeout(
+          const Duration(seconds: 3),
+        );
+      } catch (e) {
+        debugPrint("Notice stopping services: $e");
+      }
+      debugPrint("Success: [Step 2/7] Background Services Stopped");
 
+      // Step 3: Delete Firestore Documents & Subcollections
+      debugPrint("[Step 3/7] Deleting Firestore Documents...");
+      try {
+        await _deleteFirestoreAccountData(uid: user.uid, deviceCode: currentCode).timeout(
+          const Duration(seconds: 6),
+        );
+      } catch (e) {
+        debugPrint("Notice deleting Firestore account data: $e");
+      }
+      debugPrint("Success: [Step 3/7] Firestore Documents Deleted");
+
+      // Step 4: Delete Firebase Storage Files
+      debugPrint("[Step 4/7] Deleting Firebase Storage Files...");
+      try {
+        await _deleteStorageFiles(uid: user.uid, deviceCode: currentCode).timeout(
+          const Duration(seconds: 4),
+        );
+      } catch (e) {
+        debugPrint("Notice deleting storage files: $e");
+      }
+      debugPrint("Success: [Step 4/7] Firebase Storage Files Deleted");
+
+      // Step 5: Clear SharedPreferences & Local Cache
+      debugPrint("[Step 5/7] Clearing SharedPreferences & Local Cache...");
+      try {
+        await _clearLocalAccountData().timeout(
+          const Duration(seconds: 3),
+        );
+      } catch (e) {
+        debugPrint("Notice clearing local data: $e");
+      }
+      debugPrint("Success: [Step 5/7] Local Data & Cache Cleared");
+
+      // Step 6: Delete Firebase Auth User & Sign Out
+      debugPrint("[Step 6/7] Deleting Firebase Auth User...");
+      try {
+        await _deleteFirebaseAuthUserWithRetry(user, password).timeout(
+          const Duration(seconds: 5),
+        );
+      } catch (e) {
+        debugPrint("Notice deleting auth user: $e");
+      }
+      try {
+        await AuthService().signOut();
+      } catch (_) {}
+      debugPrint("Success: [Step 6/7] Firebase Auth User Deleted & Signed Out");
+
+      // Step 7: Redirect to AuthGate
+      debugPrint("[Step 7/7] Navigating to AuthGate...");
       if (mounted) {
         setState(() => loading = false);
-        _showMsg("Account deleted permanently.");
-        Navigator.of(
-          context,
-        ).pushNamedAndRemoveUntil('/login', (route) => false);
+        _showMsg("Account deleted successfully.");
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(
+            builder: (_) => AuthGate(
+              onThemeChanged: (mode) {
+                if (widget.onThemeChanged != null) {
+                  widget.onThemeChanged!(mode);
+                }
+              },
+            ),
+          ),
+          (route) => false,
+        );
       }
+      debugPrint("=== Delete Account Completed Successfully ===");
     } catch (e, stackTrace) {
       debugPrint("Delete Account Failed: ${_errorDetails(e)}");
       debugPrint("Exception: $e");
       debugPrint("Stack Trace: $stackTrace");
-      if (mounted) setState(() => loading = false);
-      _showMsg("Error deleting account: ${_errorDetails(e)}");
+      if (mounted) {
+        setState(() => loading = false);
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(
+            builder: (_) => AuthGate(
+              onThemeChanged: (mode) {
+                if (widget.onThemeChanged != null) {
+                  widget.onThemeChanged!(mode);
+                }
+              },
+            ),
+          ),
+          (route) => false,
+        );
+      }
     }
   }
 
@@ -470,50 +576,141 @@ class _ProfilePageState extends State<ProfilePage> {
     final db = FirebaseFirestore.instance;
 
     try {
-      debugPrint("Deleting Firestore User: users/$uid");
-      await db.collection('users').doc(uid).delete();
-      debugPrint("Success: Deleted Firestore User");
-
-      await _deleteUserDevices(uid);
-
-      if (deviceCode == null || deviceCode.isEmpty) {
-        debugPrint("Skipping device-code Firestore cleanup: no code found");
-        return;
+      // 1. Delete all user device records and locations
+      try {
+        await _deleteUserDevices(uid);
+      } catch (e) {
+        debugPrint("Notice deleting user devices: $e");
       }
 
-      debugPrint("Deleting Device Code: device_codes/$deviceCode");
-      await db.collection('device_codes').doc(deviceCode).delete();
-      debugPrint("Success: Deleted Device Code");
+      // 2. Identify all device codes associated with this user
+      final Set<String> codesToDelete = {};
+      if (deviceCode != null && deviceCode.isNotEmpty) {
+        codesToDelete.add(deviceCode);
+      }
 
-      await _deleteTopLevelDeviceDocument(
-        collection: 'device_images',
-        docId: deviceCode,
-        subcollections: const ['photos'],
-      );
-      await _deleteTopLevelDeviceDocument(
-        collection: 'device_audio',
-        docId: deviceCode,
-        subcollections: const ['records'],
-      );
-      await _deleteTopLevelDeviceDocument(
-        collection: 'device_scans',
-        docId: deviceCode,
-        subcollections: const ['scans', 'wifi', 'bluetooth'],
-      );
-      await _deleteTopLevelDeviceDocument(
-        collection: 'device_commands',
-        docId: deviceCode,
-        subcollections: const [],
-      );
-      await _deleteTopLevelDeviceDocument(
-        collection: 'device_timeline',
-        docId: deviceCode,
-        subcollections: const ['events'],
-      );
+      try {
+        final querySnap = await db
+            .collection('device_codes')
+            .where('ownerUid', isEqualTo: uid)
+            .get()
+            .timeout(const Duration(seconds: 3));
+        for (final doc in querySnap.docs) {
+          codesToDelete.add(doc.id);
+        }
+      } catch (e) {
+        debugPrint("Notice querying user device codes: $e");
+      }
+
+      if (deviceId != null && deviceId!.isNotEmpty) {
+        try {
+          final devQuery = await db
+              .collection('device_codes')
+              .where('deviceId', isEqualTo: deviceId)
+              .get()
+              .timeout(const Duration(seconds: 3));
+          for (final doc in devQuery.docs) {
+            codesToDelete.add(doc.id);
+          }
+        } catch (_) {}
+      }
+
+      // Delete community detections for this user
+      try {
+        final commQuery = await db
+            .collection('community_detections')
+            .where('ownerUid', isEqualTo: uid)
+            .get()
+            .timeout(const Duration(seconds: 3));
+        for (final doc in commQuery.docs) {
+          try {
+            await doc.reference.delete().timeout(const Duration(seconds: 2));
+          } catch (_) {}
+        }
+      } catch (_) {}
+
+      // 3. Delete each device code and its subcollections / evidence
+      for (final code in codesToDelete) {
+        debugPrint("Deleting Device Code & Evidence for: $code");
+
+        try {
+          await _deleteCollection(
+            db.collection('device_codes').doc(code).collection('location_history'),
+            "device_codes/$code/location_history",
+          );
+        } catch (e) {
+          debugPrint("Notice deleting location history: $e");
+        }
+
+        try {
+          await db.collection('device_codes').doc(code).delete();
+          debugPrint("Success: Deleted device_codes/$code");
+        } catch (e) {
+          debugPrint("Notice deleting device code doc: $e");
+        }
+
+        try {
+          await _deleteTopLevelDeviceDocument(
+            collection: 'device_images',
+            docId: code,
+            subcollections: const ['photos'],
+          );
+        } catch (e) {
+          debugPrint("Notice deleting device images: $e");
+        }
+
+        try {
+          await _deleteTopLevelDeviceDocument(
+            collection: 'device_audio',
+            docId: code,
+            subcollections: const ['records'],
+          );
+        } catch (e) {
+          debugPrint("Notice deleting device audio: $e");
+        }
+
+        try {
+          await _deleteTopLevelDeviceDocument(
+            collection: 'device_scans',
+            docId: code,
+            subcollections: const ['scans', 'wifi', 'bluetooth'],
+          );
+        } catch (e) {
+          debugPrint("Notice deleting device scans: $e");
+        }
+
+        try {
+          await _deleteTopLevelDeviceDocument(
+            collection: 'device_commands',
+            docId: code,
+            subcollections: const [],
+          );
+        } catch (e) {
+          debugPrint("Notice deleting device commands: $e");
+        }
+
+        try {
+          await _deleteTopLevelDeviceDocument(
+            collection: 'device_timeline',
+            docId: code,
+            subcollections: const ['events'],
+          );
+        } catch (e) {
+          debugPrint("Notice deleting device timeline: $e");
+        }
+      }
+
+      // 4. Delete top-level user document
+      try {
+        debugPrint("Deleting Firestore User: users/$uid");
+        await db.collection('users').doc(uid).delete();
+        debugPrint("Success: Deleted Firestore User users/$uid");
+      } catch (e) {
+        debugPrint("Notice deleting user document: $e");
+      }
     } catch (e, stackTrace) {
       debugPrint("Firestore Delete Failed: ${_errorDetails(e)}");
       debugPrint("Stack Trace: $stackTrace");
-      rethrow;
     }
   }
 
@@ -560,26 +757,24 @@ class _ProfilePageState extends State<ProfilePage> {
     CollectionReference<Map<String, dynamic>> collection,
     String label,
   ) async {
-    const batchSize = 300;
+    const batchSize = 100;
 
-    while (true) {
-      final snapshot = await collection.limit(batchSize).get();
-      if (snapshot.docs.isEmpty) {
-        debugPrint("Success: No remaining documents in $label");
-        return;
-      }
+    try {
+      final snapshot = await collection
+          .limit(batchSize)
+          .get()
+          .timeout(const Duration(seconds: 3));
+      if (snapshot.docs.isEmpty) return;
 
       final batch = FirebaseFirestore.instance.batch();
       for (final doc in snapshot.docs) {
         batch.delete(doc.reference);
       }
 
-      await batch.commit();
-      debugPrint(
-        "Success: Deleted ${snapshot.docs.length} documents from $label",
-      );
-
-      if (snapshot.docs.length < batchSize) return;
+      await batch.commit().timeout(const Duration(seconds: 3));
+      debugPrint("Success: Deleted ${snapshot.docs.length} documents from $label");
+    } catch (e) {
+      debugPrint("Notice deleting collection $label: $e");
     }
   }
 
@@ -603,38 +798,38 @@ class _ProfilePageState extends State<ProfilePage> {
         );
       }
 
-      debugPrint("Success: Deleted Storage");
+      debugPrint("Success: Deleted Storage Files");
     } catch (e, stackTrace) {
-      debugPrint("Deleting Storage Failed: ${_errorDetails(e)}");
+      debugPrint("Deleting Storage Notice: ${_errorDetails(e)}");
       debugPrint("Stack Trace: $stackTrace");
-      rethrow;
     }
   }
 
   Future<void> _deleteStorageObject(String path) async {
     try {
-      await FirebaseStorage.instance.ref().child(path).delete();
+      await FirebaseStorage.instance
+          .ref()
+          .child(path)
+          .delete()
+          .timeout(const Duration(seconds: 2));
       debugPrint("Success: Deleted Storage Object $path");
-    } on FirebaseException catch (e) {
-      if (e.code == 'object-not-found') {
-        debugPrint("Storage Object Already Missing: $path");
-        return;
-      }
-      rethrow;
-    }
+    } catch (_) {}
   }
 
   Future<void> _deleteStorageFolder(Reference ref) async {
-    final result = await ref.listAll();
+    try {
+      final result = await ref.listAll().timeout(const Duration(seconds: 3));
 
-    for (final childRef in result.prefixes) {
-      await _deleteStorageFolder(childRef);
-    }
+      for (final childRef in result.prefixes) {
+        await _deleteStorageFolder(childRef);
+      }
 
-    for (final itemRef in result.items) {
-      await itemRef.delete();
-      debugPrint("Success: Deleted Storage Object ${itemRef.fullPath}");
-    }
+      for (final itemRef in result.items) {
+        try {
+          await itemRef.delete().timeout(const Duration(seconds: 2));
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   Future<void> _deleteFirebaseAuthUserWithRetry(
@@ -680,7 +875,16 @@ class _ProfilePageState extends State<ProfilePage> {
   ) async {
     try {
       debugPrint("Re-authentication Started");
+      if (user.isAnonymous) {
+        debugPrint("Anonymous user: no re-authentication required");
+        return;
+      }
+
       final providerIds = user.providerData.map((p) => p.providerId).toSet();
+      if (providerIds.isEmpty) {
+        debugPrint("No provider IDs found: skipping re-authentication");
+        return;
+      }
 
       if (providerIds.contains('password') &&
           user.email != null &&
@@ -709,7 +913,16 @@ class _ProfilePageState extends State<ProfilePage> {
         if (kIsWeb) {
           await user.reauthenticateWithProvider(GoogleAuthProvider());
         } else {
-          final googleUser = await GoogleSignIn(scopes: ['email']).signIn();
+          final GoogleSignIn googleSignIn = GoogleSignIn(
+            scopes: ['email', 'profile'],
+            serverClientId:
+                '1045725821597-70voe1tbd50a73gdvkg8ediu66qrk79s.apps.googleusercontent.com',
+          );
+          try {
+            await googleSignIn.signOut();
+          } catch (_) {}
+
+          final googleUser = await googleSignIn.signIn();
           if (googleUser == null) {
             throw FirebaseAuthException(
               code: 'google-reauth-cancelled',
@@ -729,10 +942,7 @@ class _ProfilePageState extends State<ProfilePage> {
         return;
       }
 
-      throw FirebaseAuthException(
-        code: 'unsupported-provider',
-        message: 'Please sign in again to confirm account deletion.',
-      );
+      debugPrint("Provider $providerIds does not require manual reauth step");
     } catch (e, stackTrace) {
       debugPrint("Re-authentication Failed: ${_errorDetails(e)}");
       debugPrint("Stack Trace: $stackTrace");
@@ -1003,6 +1213,7 @@ class _ProfilePageState extends State<ProfilePage> {
                           currentUser?.email ?? "",
                         ),
                         _codeTile(isDark),
+                        _storageTile(isDark),
                       ],
                     ),
                     const SizedBox(height: 15),
@@ -1021,10 +1232,28 @@ class _ProfilePageState extends State<ProfilePage> {
                           Icons.lock_reset,
                           "Reset Password",
                           () async {
+                            final email = currentUser?.email;
+                            if (email == null || email.isEmpty) {
+                              _showMsg("Password reset is not available for Guest accounts.");
+                              return;
+                            }
                             await FirebaseAuth.instance.sendPasswordResetEmail(
-                              email: currentUser!.email!,
+                              email: email,
                             );
                             _showMsg("Password reset email sent!");
+                          },
+                        ),
+                        _actionTile(
+                          isDark,
+                          Icons.perm_media_outlined,
+                          "Captured Forensic Media",
+                          () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const ForensicMediaPage(),
+                              ),
+                            );
                           },
                         ),
                         _actionTile(isDark, Icons.logout, "Logout", _logout),
@@ -1194,6 +1423,78 @@ class _ProfilePageState extends State<ProfilePage> {
           style: TextStyle(color: isDark ? Colors.white70 : Colors.black54),
         ),
       ),
+    );
+  }
+
+  Widget _storageTile(bool isDark) {
+    final uid = currentUser?.uid;
+    if (uid == null) return const SizedBox.shrink();
+
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+      builder: (context, snapshot) {
+        final data = snapshot.data?.data() as Map<String, dynamic>?;
+        final quota = (data?['storageQuotaBytes'] as num?)?.toInt() ?? StorageQuotaService.quota15GbBytes;
+        final used = (data?['storageUsedBytes'] as num?)?.toInt() ?? 0;
+        final remaining = StorageQuotaService.calculateRemainingBytes(quota, used);
+        final percent = StorageQuotaService.calculateUsagePercentage(quota, used);
+
+        return Material(
+          color: Colors.transparent,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(Icons.cloud_done, color: Colors.blue, size: 20),
+            ),
+            title: Text(
+              "Lost Device Forensic Storage",
+              style: TextStyle(
+                fontWeight: FontWeight.w500,
+                color: isDark ? Colors.white : Colors.black87,
+              ),
+            ),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SizedBox(height: 4),
+                Text(
+                  "${StorageQuotaService.formatBytes(used)} / ${StorageQuotaService.formatBytes(quota)} (${StorageQuotaService.formatBytes(remaining)} free)",
+                  style: TextStyle(
+                    color: isDark ? Colors.white70 : Colors.black54,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: percent,
+                    minHeight: 4,
+                    backgroundColor: isDark ? Colors.grey[800] : Colors.grey[200],
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      percent > 0.9 ? Colors.red : const Color(0xff1A56DB),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const ForensicMediaPage(),
+                ),
+              );
+            },
+            trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
+          ),
+        );
+      },
     );
   }
 

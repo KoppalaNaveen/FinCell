@@ -2,6 +2,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:geolocator/geolocator.dart';
+import 'offline_location_service.dart';
+import 'offline_direct_trace_service.dart';
+import 'sync_manager.dart';
+import 'security_validator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class BackgroundTracking {
   static const MethodChannel _channel = MethodChannel(
@@ -42,7 +47,9 @@ class BackgroundTracking {
           final double? accuracy = (args['accuracy'] as num?)?.toDouble();
           final int? battery = (args['battery'] as num?)?.toInt();
 
-          debugPrint("Raw native location data: $args");
+          final redactedCoords = SecurityValidator.redactCoordinates(lat, lng);
+          final redactedCode = SecurityValidator.redactCode(code);
+          debugPrint("Native location data received for $redactedCode: $redactedCoords");
 
           if (code == null || lat == null || lng == null) {
             debugPrint("Invalid location data");
@@ -67,22 +74,14 @@ class BackgroundTracking {
     try {
       _resetCacheIfCodeChanged(normalizedCode);
 
-      final codeRef = FirebaseFirestore.instance
-          .collection("device_codes")
-          .doc(normalizedCode);
-
-      final codeDoc = await codeRef.get();
-      if (!codeDoc.exists) {
-        debugPrint("Tracking start failed: code not found: $normalizedCode");
-        return false;
-      }
-
-      await _updateTrackingStatus(normalizedCode, true);
+      _updateTrackingStatus(normalizedCode, true).catchError((e) {
+        debugPrint("Background status update deferred: $e");
+      });
 
       try {
         final position = await Geolocator.getCurrentPosition(
           desiredAccuracy: LocationAccuracy.bestForNavigation,
-        );
+        ).timeout(const Duration(seconds: 3));
 
         await _sendLocationToFirestore(
           normalizedCode,
@@ -181,11 +180,19 @@ class BackgroundTracking {
       if (now - _lastWriteTime < 1500) return;
       _lastWriteTime = now;
 
+      // 1. Continuously save to Encrypted Local SQLite DB (Module 1 & 2)
+      await OfflineLocationService.saveLocation(
+        lat,
+        lng,
+        accuracy: accuracy ?? 0.0,
+        battery: battery ?? 0,
+      );
+
       final codeRef = FirebaseFirestore.instance
           .collection('device_codes')
           .doc(normalizedCode);
 
-      // Always update device_codes doc immediately
+      // Always update device_codes doc immediately if online
       await codeRef.set({
         'latitude': lat,
         'longitude': lng,
@@ -200,6 +207,9 @@ class BackgroundTracking {
           'accuracy': accuracy,
           'battery': battery ?? 0,
           'updatedAt': FieldValue.serverTimestamp(),
+          'uploadedAt': FieldValue.serverTimestamp(),
+          'capturedAt': DateTime.now().toIso8601String(),
+          'syncSource': 'live',
         },
         'updatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
@@ -245,8 +255,10 @@ class BackgroundTracking {
       }
 
       debugPrint("Firestore location updated");
+      SyncManager.instance.syncAll(normalizedCode);
     } catch (e) {
-      debugPrint("Firestore write failed: $e");
+      debugPrint("Firestore write failed (queued in offline DB): $e");
+      SyncManager.instance.syncAll(code.trim().toUpperCase());
     }
   }
 
@@ -255,13 +267,33 @@ class BackgroundTracking {
     final normalizedCode = code.trim().toUpperCase();
     if (normalizedCode.isEmpty) return;
 
+    // 1. If testing on the current device itself, trigger immediately
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final localCode = prefs.getString('uniqueCode') ?? prefs.getString('device_code');
+      if (localCode != null && localCode.trim().toUpperCase() == normalizedCode) {
+        if (play) {
+          await playAlarmSoundLocally(normalizedCode);
+        } else {
+          await stopAlarmSoundLocally(normalizedCode);
+        }
+      }
+    } catch (_) {}
+
+    // 2. Direct UDP dispatch to remote device on local network / hotspot
+    try {
+      await OfflineDirectTraceService.instance.sendDirectSoundCommand(normalizedCode, play);
+    } catch (_) {}
+
+    // 3. Firestore cloud command dispatch to remote lost device
     try {
       final payload = {
         'playSound': play,
         'stopSound': !play,
         'command': play ? 'alarm' : 'stop_alarm',
-        'status': play ? 'pending' : 'stopped',
+        'status': play ? 'playing' : 'stopped',
         'timestamp': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
       };
 
       await FirebaseFirestore.instance
@@ -275,7 +307,7 @@ class BackgroundTracking {
           .set({'playSound': play}, SetOptions(merge: true));
 
       debugPrint(
-        "🔥 Device command sent: playSound=$play for code=$normalizedCode",
+        "🔥 Device command sent to remote lost device: playSound=$play for code=$normalizedCode",
       );
     } catch (e) {
       debugPrint("🔥 Command send error: $e");
@@ -288,6 +320,24 @@ class BackgroundTracking {
       await _channel.invokeMethod('playNotificationSound');
     } catch (e) {
       debugPrint("Local notification sound error: $e");
+    }
+  }
+
+  static Future<void> playAlarmSoundLocally([String? code]) async {
+    if (kIsWeb) return;
+    try {
+      await _channel.invokeMethod('startAlarm', {'code': code ?? ''});
+    } catch (e) {
+      debugPrint("Local startAlarm error: $e");
+    }
+  }
+
+  static Future<void> stopAlarmSoundLocally([String? code]) async {
+    if (kIsWeb) return;
+    try {
+      await _channel.invokeMethod('stopAlarm', {'code': code ?? ''});
+    } catch (e) {
+      debugPrint("Local stopAlarm error: $e");
     }
   }
 

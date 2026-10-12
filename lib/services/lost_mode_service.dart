@@ -2,6 +2,7 @@ import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
+import 'ble_community_service.dart';
 
 class LostModeService {
   static final FirebaseFirestore _db = FirebaseFirestore.instance;
@@ -92,16 +93,17 @@ class LostModeService {
       try {
         if (isLost) {
           debugPrint("🚀 Starting native tracking service");
-
           await _channel.invokeMethod("startService", {"code": code});
+          // Phase 3: Start BLE Community Advertising
+          await BLECommunityService.instance.startAdvertising(code);
         } else {
           debugPrint("🛑 Stopping native tracking service");
-
           await _channel.invokeMethod("stopService");
+          // Phase 3: Stop BLE Community Advertising
+          await BLECommunityService.instance.stopAdvertising();
         }
       } catch (e) {
         debugPrint("❌ Native service error: $e");
-
         // ❗ DO NOT crash app
       }
     } catch (e) {

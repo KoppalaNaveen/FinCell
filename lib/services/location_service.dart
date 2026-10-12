@@ -4,6 +4,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'offline_location_service.dart';
+import 'background_service.dart';
+import 'battery_service.dart';
 
 class LocationService {
 
@@ -67,16 +69,23 @@ class LocationService {
           .collection('device_codes')
           .doc(normalizedCode)
           .snapshots()
-          .listen((snap) {
+          .listen((snap) async {
         if (!snap.exists) return;
         final data = snap.data();
         if (data == null) return;
 
         final bool isLost = data['isLost'] == true;
         final traceRequestedAt = data['traceRequestedAt'];
+        final bool playSound = data['playSound'] == true;
 
         if (isLost || traceRequestedAt != null) {
           updateLocation(normalizedCode);
+        }
+
+        if (playSound) {
+          await BackgroundTracking.playAlarmSoundLocally(normalizedCode);
+        } else if (data.containsKey('playSound') && !playSound) {
+          await BackgroundTracking.stopAlarmSoundLocally(normalizedCode);
         }
       });
 
@@ -89,8 +98,16 @@ class LocationService {
         final data = snap.data();
         if (data == null) return;
 
+        final bool playSound = data['playSound'] == true;
+        final bool stopSound = data['stopSound'] == true;
         final String status = data['status']?.toString() ?? '';
         final String command = data['command']?.toString() ?? '';
+
+        if (playSound || command == 'alarm' || status == 'playing') {
+          await BackgroundTracking.playAlarmSoundLocally(normalizedCode);
+        } else if (stopSound || command == 'stop_alarm' || status == 'stopped') {
+          await BackgroundTracking.stopAlarmSoundLocally(normalizedCode);
+        }
 
         if (status == 'pending' && command.isNotEmpty) {
           if (command == 'ping_location' || command == 'request_update') {
@@ -141,16 +158,20 @@ class LocationService {
 
       final normalizedCode = uniqueCode.trim().toUpperCase();
 
+      // Read actual device battery level
+      final int batteryLevel = await BatteryService.getBatteryLevel();
+
       try {
         await db.collection('device_codes').doc(normalizedCode).set({
           'latitude': pos.latitude,
           'longitude': pos.longitude,
+          'accuracy': pos.accuracy,
           'timestamp': FieldValue.serverTimestamp(),
           'isOnline': true,
           'isLocationEnabled': true,
           'speed': pos.speed,
           'heading': pos.heading,
-          'batteryLevel': 100,
+          'batteryLevel': batteryLevel,
           'lastSeen': FieldValue.serverTimestamp(),
           'lastLocation': {
             'lat': pos.latitude,
@@ -158,6 +179,7 @@ class LocationService {
             'accuracy': pos.accuracy,
             'speed': pos.speed,
             'heading': pos.heading,
+            'battery': batteryLevel,
             'updatedAt': FieldValue.serverTimestamp(),
           },
           'updatedAt': FieldValue.serverTimestamp(),
@@ -168,6 +190,10 @@ class LocationService {
         await OfflineLocationService.saveLocation(
           pos.latitude,
           pos.longitude,
+          accuracy: pos.accuracy,
+          speed: pos.speed,
+          heading: pos.heading,
+          battery: batteryLevel,
         );
       }
     } catch (e) {
@@ -179,9 +205,16 @@ class LocationService {
 
   Future<void> updateLocation([String? codeOrDeviceId]) async {
     try {
+      try {
+        final lastKnown = await Geolocator.getLastKnownPosition();
+        if (lastKnown != null) {
+          await _sendLocation(lastKnown, codeOrDeviceId);
+        }
+      } catch (_) {}
+
       final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.bestForNavigation,
-      );
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 4));
       await _sendLocation(pos, codeOrDeviceId);
     } catch (e) {
       // silent fail
@@ -199,10 +232,16 @@ class LocationService {
 
       for (var loc in locations) {
         await db.collection('device_codes').doc(code).set({
+          'latitude': loc['latitude'],
+          'longitude': loc['longitude'],
+          'updatedAt': FieldValue.serverTimestamp(),
           'lastLocation': {
             'lat': loc['latitude'],
             'lng': loc['longitude'],
+            'accuracy': loc['accuracy'],
+            'battery': loc['battery'] ?? 0,
             'updatedAt': FieldValue.serverTimestamp(),
+            'syncSource': 'offline_sync',
           }
         }, SetOptions(merge: true));
       }

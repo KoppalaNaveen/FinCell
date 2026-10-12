@@ -1,0 +1,61 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // ================= USER 15 GB LOST DEVICE MEDIA STORAGE =================
+    match /users/{userId}/lost_devices/{deviceCode}/images/{imageId} {
+      allow read, delete: if isOwner(userId);
+      allow write, create: if isOwner(userId)
+        && request.resource.size < 50 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /users/{userId}/lost_devices/{deviceCode}/audio/{audioId} {
+      allow read, delete: if isOwner(userId);
+      allow write, create: if isOwner(userId)
+        && request.resource.size < 50 * 1024 * 1024
+        && request.resource.contentType.matches('audio/.*');
+    }
+
+    // ================= COVERT PHOTOS STORAGE =================
+    match /device_images/{code}/{imageId} {
+      allow read, write, delete: if isAuthenticated()
+        && request.resource.size < 50 * 1024 * 1024;
+    }
+
+    // ================= AMBIENT AUDIO STORAGE =================
+    match /device_audio/{code}/{audioId} {
+      allow read, write, delete: if isAuthenticated()
+        && request.resource.size < 50 * 1024 * 1024;
+    }
+
+    // ================= LEGACY STORAGE PATHS =================
+    match /lost_images/{code}/{imageId} {
+      allow read, write, delete: if isAuthenticated()
+        && request.resource.size < 50 * 1024 * 1024;
+    }
+
+    match /lost_audio/{code}/{audioId} {
+      allow read, write, delete: if isAuthenticated()
+        && request.resource.size < 50 * 1024 * 1024;
+    }
+
+    match /profile_photos/{userId}.jpg {
+      allow read, write, delete: if isAuthenticated();
+    }
+
+    // ================= DEFAULT DENY =================
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

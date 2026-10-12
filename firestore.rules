@@ -3,51 +3,97 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDeviceOwner(code) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/device_codes/$(code)) &&
+        get(/databases/$(database)/documents/device_codes/$(code)).data.ownerUid == request.auth.uid;
+    }
+
     // ================= USERS & USER DEVICES =================
     match /users/{userId} {
-      allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+      allow read, write, delete: if isOwner(userId);
 
       match /{allPaths=**} {
-        allow read, write, delete: if true;
+        allow read, write, delete: if isOwner(userId);
       }
     }
 
-    // ================= DEVICE CODES (GLOBAL SEARCH, CREATION & TRACKING) =================
+    // ================= DEVICE CODES (AUTHENTICATED & OWNED ACCESS) =================
     match /device_codes/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.ownerUid == request.auth.uid;
+      allow update: if isAuthenticated() && (
+        resource.data.ownerUid == request.auth.uid ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'latitude', 'longitude', 'batteryLevel', 'lastLocation',
+          'lastSeen', 'updatedAt', 'isOnline', 'isLocationEnabled',
+          'ble_active_hash', 'playSound', 'traceRequestedAt', 'isLost',
+          'timestamp', 'speed', 'heading', 'accuracy', 'gpsAccuracy',
+          'altitude', 'battery', 'networkType',
+          'gpsStatus', 'riskScore', 'cellTowerInfo', 'syncSource',
+          'ownerUid', 'deviceId', 'deviceCode', 'createdAt'
+        ])
+      );
+      allow delete: if isAuthenticated() && resource.data.ownerUid == request.auth.uid;
+
+      match /location_history/{historyId} {
+        allow read, write: if isAuthenticated();
+      }
     }
 
-    // ================= DEVICE COMMANDS & MEDIA SCANS =================
+    // ================= DEVICE COMMANDS =================
     match /device_commands/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read, write, create, update: if isAuthenticated();
     }
 
+    // ================= DEVICE AUDIO EVIDENCE =================
     match /device_audio/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read, write: if isAuthenticated();
+
       match /{allPaths=**} {
-        allow read, write, create, update, delete: if true;
+        allow read, write: if isAuthenticated();
       }
     }
 
+    // ================= DEVICE IMAGES EVIDENCE =================
     match /device_images/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read, write: if isAuthenticated();
+
       match /{allPaths=**} {
-        allow read, write, create, update, delete: if true;
+        allow read, write: if isAuthenticated();
       }
     }
 
+    // ================= DEVICE ENVIRONMENT SCANS =================
     match /device_scans/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read, write: if isAuthenticated();
+
       match /{allPaths=**} {
-        allow read, write, create, update, delete: if true;
+        allow read, write: if isAuthenticated();
       }
     }
 
+    // ================= SECURITY TIMELINE =================
     match /device_timeline/{code} {
-      allow read, write, create, update, delete: if true;
+      allow read, write: if isAuthenticated();
+
       match /{allPaths=**} {
-        allow read, write, create, update, delete: if true;
+        allow read, write: if isAuthenticated();
       }
+    }
+
+    // ================= COMMUNITY BLE DETECTIONS =================
+    match /community_detections/{detectionId} {
+      allow read, create, update: if isAuthenticated();
     }
   }
 }
